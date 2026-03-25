@@ -18,7 +18,7 @@ The Python backend stores all AgentFS data in PostgreSQL (inline content + S3 fo
 ```sql
 CREATE TABLE agentfs_file (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    scope TEXT NOT NULL CHECK (scope IN ('system', 'org', 'user')),
+    scope TEXT NOT NULL CHECK (scope IN ('system', 'organization', 'user')),
     organization_id UUID,
     user_id UUID,
     path TEXT NOT NULL,
@@ -33,7 +33,7 @@ CREATE TABLE agentfs_file (
 );
 
 CREATE TABLE agentfs_kv (
-    scope TEXT NOT NULL CHECK (scope IN ('system', 'org', 'user')),
+    scope TEXT NOT NULL CHECK (scope IN ('system', 'organization', 'user')),
     organization_id UUID,
     user_id UUID,
     key TEXT NOT NULL,
@@ -85,16 +85,22 @@ No direct database access. No OverlayFS. No WriteFilterFS. Scope isolation and w
 
 ### Mount Layout
 
+The agent sees a **merged view** — skills from all scopes (system, organization, user) are flattened into a single directory. Higher-priority scopes shadow lower ones (user > organization > system).
+
 ```
-/mountpoint/
-├── skills/
-│   ├── system/   → GET/POST /api/v2/fs/skills/system/...
-│   ├── org/      → GET/PUT/DELETE/POST /api/v2/fs/skills/org/...
-│   └── user/     → GET/PUT/DELETE/POST /api/v2/fs/skills/user/...
-└── outputs/      (future namespace)
-    ├── org/
-    └── user/
+/skills/                          ← ReevoFS mount point (merged view)
+├── email-drafting/
+│   └── SKILL.md                  ← from system scope (or org override)
+├── custom-crm/
+│   └── SKILL.md                  ← from organization scope
+├── my-personal-skill/
+│   └── SKILL.md                  ← from user scope
+└── ...
 ```
+
+The agent does NOT see `system/`, `organization/`, `user/` subdirectories. Scope resolution happens inside ReevoFS — it queries all three scopes via the API and merges results with deduplication (user > org > system priority).
+
+For writes, ReevoFS writes to the user scope by default. System and org skills are read-only from the agent's perspective.
 
 ### ReevoFS Implementation
 
@@ -122,18 +128,22 @@ Inodes are ephemeral — allocated on demand, never persisted:
 
 ### FUSE Op → API Mapping
 
-| FUSE Op | API Call |
-|---------|----------|
-| `lookup(parent, name)` | Populate via `POST /_list`, check cache |
-| `getattr(ino)` | Return cached attrs (size from content cache) |
-| `readdir(ino)` | `POST /{ns}/{scope}/_list` with parent path |
-| `read(ino, offset, size)` | `GET /{ns}/{scope}/{path}`, cache content |
-| `write(ino, offset, data)` | Buffer in memory |
-| `flush(ino, fh)` | `PUT /{ns}/{scope}/{path}` with buffered content |
-| `create(parent, name)` | `PUT /{ns}/{scope}/{path}` with empty content |
-| `mkdir(parent, name)` | `PUT /{ns}/{scope}/{path}/.keep` (creates parent) |
-| `unlink(parent, name)` | `DELETE /{ns}/{scope}/{path}` |
-| `rmdir(parent, name)` | `DELETE /{ns}/{scope}/{path}` (recursive) |
+For reads, ReevoFS queries all three scopes and merges (user > org > system). For writes, defaults to user scope.
+
+| FUSE Op | API Call | Scope Behavior |
+|---------|----------|---------------|
+| `lookup(parent, name)` | Populate via `POST /_list` on each scope | Merged: first match wins (user > org > system) |
+| `getattr(ino)` | Return cached attrs | From whichever scope owns the file |
+| `readdir(ino)` | `POST /_list` on all 3 scopes, deduplicate | Merged listing, user shadows org shadows system |
+| `read(ino, offset, size)` | `GET /{ns}/{scope}/{path}` | Read from owning scope |
+| `write(ino, offset, data)` | Buffer in memory | — |
+| `flush(ino, fh)` | `PUT /{ns}/user/{path}` | Always writes to user scope |
+| `create(parent, name)` | `PUT /{ns}/user/{path}` | Creates in user scope |
+| `mkdir(parent, name)` | `PUT /{ns}/user/{path}/.keep` | Creates in user scope |
+| `unlink(parent, name)` | `DELETE /{ns}/user/{path}` | Only deletes from user scope |
+| `rmdir(parent, name)` | `DELETE /{ns}/user/{path}` | Only deletes from user scope |
+
+System and org skills appear in listings but return `EACCES` on write/delete attempts.
 
 ### Write Path
 
@@ -201,18 +211,63 @@ reevofs write -c "content" /path
 echo "content" | reevofs write /path
 ```
 
+## AgentCore Sandbox Integration
+
+### Ask Reevo Execution Flow
+
+Ask Reevo uses sandbox containers with AgentCore in us-west to execute bash commands. AgentCore itself has no knowledge of ReevoFS — we mount it during our container bootup process before the agent starts.
+
+```
+User → Ask Reevo → Backend provisions sandbox container
+                      ├── Container bootup script:
+                      │     1. Inject auth token into env (outside agent control)
+                      │     2. Mount ReevoFS: reevofs mount /skills
+                      │     3. Start AgentCore
+                      ├── Container ID is reused across requests
+                      └── Agent reads skills from /skills/ as regular files
+```
+
+### Token Flow
+
+1. Backend creates/reuses a sandbox container with a stable container ID
+2. Backend appends an auth token (JWT with `user_id`, `org_id`) to the container environment — **outside agent control**, the agent never sees or manages tokens
+3. Container bootup script runs `reevofs mount /skills` which reads the token from env
+4. The agent sees skills as regular files — `cat /skills/email-drafting/SKILL.md` just works
+
+### Container Lifecycle
+
+```
+Container (persistent per session):
+  ├── First request: container created, token injected, reevofs mounted, AgentCore started
+  ├── Subsequent requests: same container ID reused, mount persists
+  └── Session end: container stopped (or recycled)
+```
+
+### Environments
+
+| Environment | API Target | Container Runtime |
+|-------------|-----------|-------------------|
+| Production | `api.reevo.ai` | AgentCore containers in us-west |
+| Development | `api-dev.reevo.ai` | AgentCore dev containers |
+| Local dev | `localhost:8000` | AgentCore dev (same containers, local API) |
+
+Local dev runs against AgentCore dev containers, with the API pointing to localhost.
+
 ## Implementation Status
 
-- [x] Phase 1: Python backend with Postgres (done)
+- [x] Phase 1: Python backend with Postgres (done — PR merged)
 - [x] Phase 2: Rust FUSE layer via REST API (done — current implementation)
-- [ ] Phase 3: Add `outputs` namespace for agent output mounts
-- [ ] Phase 4: HTTP/2 + connection pooling optimization
-- [ ] Phase 5: WebSocket or SSE for push-based cache invalidation (optional)
+- [ ] Phase 3: AgentCore sandbox integration (token injection + mount)
+- [ ] Phase 4: Add `outputs` namespace for agent output mounts
+- [ ] Phase 5: HTTP/2 + connection pooling optimization
+- [ ] Phase 6: WebSocket or SSE for push-based cache invalidation (optional)
 
 ## Key Decisions
 
 - **No direct SQL** — API is the only data path, enforcing auth and scope at the boundary
 - **No OverlayFS** — scopes are separate directories, not layered; the API handles visibility
 - **No DB/S3 credentials in sandbox** — only API token needed
+- **Token appended externally** — agent never sees or controls its own auth
 - **Ephemeral inodes** — rebuilt per mount, no persistence needed
 - **Write buffering** — reduces API calls, full content sent on flush
+- **Container reuse** — same container ID across requests, mount persists
