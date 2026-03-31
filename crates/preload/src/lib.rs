@@ -1,16 +1,16 @@
 //! LD_PRELOAD shim — intercepts file ops for /reevofs/* paths.
 //! All other paths pass through with zero overhead.
 //!
-//! Intercepts: openat, open, open64, read, close, fstatat, stat, lstat, access
-//! Modern glibc uses openat/fstatat instead of open/stat, so both are needed.
+//! Strategy: When a /reevofs/* path is opened, fetch content via HTTP,
+//! write it to a memfd (or pipe), and return the real kernel FD.
+//! This means fstat/read/close/lseek all work natively on the kernel FD.
 
 #![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unused_variables)]
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 use reevofs_api::ReevoClient;
@@ -98,35 +98,59 @@ unsafe fn dlsym_next(name: &[u8]) -> *mut c_void {
     libc::dlsym(libc::RTLD_NEXT, name.as_ptr() as *const c_char)
 }
 
-// ---------------------------------------------------------------------------
-// Virtual FD table (900_000+ range)
-// ---------------------------------------------------------------------------
-
-struct VirtualFile {
-    content: Vec<u8>,
-    offset: usize,
-}
-
-static VIRTUAL_FDS: Lazy<Mutex<HashMap<c_int, VirtualFile>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static NEXT_VFD: Lazy<Mutex<c_int>> = Lazy::new(|| Mutex::new(900_000));
-
-fn alloc_vfd(content: Vec<u8>) -> c_int {
-    let mut next = NEXT_VFD.lock().unwrap();
-    let fd = *next;
-    *next += 1;
-    VIRTUAL_FDS.lock().unwrap().insert(fd, VirtualFile { content, offset: 0 });
-    fd
-}
-
-fn is_virtual_fd(fd: c_int) -> bool { fd >= 900_000 }
-
 fn set_errno(err: c_int) {
     unsafe {
         #[cfg(target_os = "linux")]
         { *libc::__errno_location() = err; }
         #[cfg(target_os = "macos")]
         { *libc::__error() = err; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Create a real kernel FD with content using memfd_create
+// Falls back to pipe if memfd is unavailable.
+// ---------------------------------------------------------------------------
+
+fn create_fd_with_content(content: &[u8]) -> c_int {
+    unsafe {
+        // Try memfd_create first (supports fstat, lseek, mmap)
+        let name = b"reevofs\0";
+        #[cfg(target_os = "linux")]
+            let fd = {
+                #[cfg(target_arch = "x86_64")]
+                const SYS_MEMFD: libc::c_long = 319;
+                #[cfg(target_arch = "aarch64")]
+                const SYS_MEMFD: libc::c_long = 279;
+                libc::syscall(SYS_MEMFD, name.as_ptr(), 0 as c_int) as c_int
+            };
+            #[cfg(not(target_os = "linux"))]
+            let fd: c_int = -1;
+        if fd >= 0 {
+            let mut written = 0usize;
+            while written < content.len() {
+                let n = libc::write(fd, content[written..].as_ptr() as *const c_void, content.len() - written);
+                if n < 0 { break; }
+                written += n as usize;
+            }
+            libc::lseek(fd, 0, libc::SEEK_SET);
+            return fd;
+        }
+
+        // Fallback: pipe (doesn't support lseek/fstat size, but read works)
+        let mut fds = [0 as c_int; 2];
+        if libc::pipe(fds.as_mut_ptr()) == 0 {
+            let mut written = 0usize;
+            while written < content.len() {
+                let n = libc::write(fds[1], content[written..].as_ptr() as *const c_void, content.len() - written);
+                if n < 0 { break; }
+                written += n as usize;
+            }
+            libc::close(fds[1]);
+            return fds[0]; // read end
+        }
+
+        -1
     }
 }
 
@@ -141,7 +165,13 @@ fn try_open_reevofs(path_str: &str) -> Option<c_int> {
     let _guard = ReentrancyGuard::try_enter()?;
     let (cfg, api_path) = match_path(path_str)?;
     match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-        Ok(resp) => Some(alloc_vfd(resp.content.into_bytes())),
+        Ok(resp) => {
+            let fd = create_fd_with_content(resp.content.as_bytes());
+            if fd < 0 {
+                set_errno(libc::EIO);
+            }
+            Some(fd)
+        }
         Err(_) => {
             set_errno(libc::ENOENT);
             Some(-1)
@@ -150,14 +180,13 @@ fn try_open_reevofs(path_str: &str) -> Option<c_int> {
 }
 
 // ---------------------------------------------------------------------------
-// openat — this is what modern glibc/Python actually uses
+// openat — what modern glibc/Python actually uses
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
-            // Only intercept absolute paths (dirfd is ignored for absolute paths)
             if s.starts_with('/') {
                 if let Some(result) = try_open_reevofs(s) {
                     return result;
@@ -171,7 +200,7 @@ pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int,
 }
 
 // ---------------------------------------------------------------------------
-// open / open64 — legacy, but still used by some programs
+// open / open64
 // ---------------------------------------------------------------------------
 
 unsafe fn do_open(path: *const c_char, flags: c_int, mode: libc::mode_t, sym: &[u8]) -> c_int {
@@ -198,44 +227,8 @@ pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::m
 }
 
 // ---------------------------------------------------------------------------
-// read / close — only intercept virtual FDs
-// ---------------------------------------------------------------------------
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
-    if is_virtual_fd(fd) {
-        let mut fds = VIRTUAL_FDS.lock().unwrap();
-        if let Some(vf) = fds.get_mut(&fd) {
-            let remaining = vf.content.len().saturating_sub(vf.offset);
-            let n = std::cmp::min(count, remaining);
-            if n > 0 {
-                std::ptr::copy_nonoverlapping(vf.content[vf.offset..].as_ptr(), buf as *mut u8, n);
-                vf.offset += n;
-            }
-            return n as libc::ssize_t;
-        }
-        set_errno(libc::EBADF);
-        return -1;
-    }
-    type F = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t) -> libc::ssize_t;
-    let real: F = std::mem::transmute(dlsym_next(b"read\0"));
-    real(fd, buf, count)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn close(fd: c_int) -> c_int {
-    if is_virtual_fd(fd) {
-        VIRTUAL_FDS.lock().unwrap().remove(&fd);
-        return 0;
-    }
-    type F = unsafe extern "C" fn(c_int) -> c_int;
-    let real: F = std::mem::transmute(dlsym_next(b"close\0"));
-    real(fd)
-}
-
-// ---------------------------------------------------------------------------
-// fstatat (aka newfstatat) — what modern glibc/Python uses for stat()
-// Also intercept __xstat for older glibc
+// stat / lstat / fstatat — intercept path-based stat for /reevofs/*
+// (fstat works natively since we return real kernel FDs now)
 // ---------------------------------------------------------------------------
 
 fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
@@ -358,7 +351,7 @@ pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut lib
 }
 
 // ---------------------------------------------------------------------------
-// access
+// access / faccessat
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
@@ -387,38 +380,4 @@ pub unsafe extern "C" fn faccessat(dirfd: c_int, path: *const c_char, mode: c_in
     type F = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
     let real: F = std::mem::transmute(dlsym_next(b"faccessat\0"));
     real(dirfd, path, mode, flags)
-}
-
-// ---------------------------------------------------------------------------
-// fstat — Python calls fstat(fd) right after openat() returns our VFD
-// ---------------------------------------------------------------------------
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
-    if is_virtual_fd(fd) {
-        let fds = VIRTUAL_FDS.lock().unwrap();
-        if let Some(vf) = fds.get(&fd) {
-            std::ptr::write_bytes(buf, 0, 1);
-            (*buf).st_mode = libc::S_IFREG | 0o644;
-            (*buf).st_size = vf.content.len() as libc::off_t;
-            (*buf).st_nlink = 1;
-            return 0;
-        }
-        set_errno(libc::EBADF);
-        return -1;
-    }
-    type F = unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int;
-    let real: F = std::mem::transmute(dlsym_next(b"fstat\0"));
-    real(fd, buf)
-}
-
-#[cfg(target_os = "linux")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -> c_int {
-    if is_virtual_fd(fd) {
-        return fstat(fd, buf);
-    }
-    type F = unsafe extern "C" fn(c_int, c_int, *mut libc::stat) -> c_int;
-    let real: F = std::mem::transmute(dlsym_next(b"__fxstat\0"));
-    real(ver, fd, buf)
 }
