@@ -22,7 +22,7 @@ use fuser::{
 };
 use log::{debug, error, warn};
 
-use crate::api::{ApiError, ReevoClient};
+use reevofs_api::{ApiError, ReevoClient};
 
 const TTL: Duration = Duration::from_secs(5);
 const BLOCK_SIZE: u32 = 512;

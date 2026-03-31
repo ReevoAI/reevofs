@@ -1,0 +1,12 @@
+[package]
+name = "reevofs-preload"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+reevofs-api = { path = "../api" }
+libc = "0.2"
+once_cell = "1"

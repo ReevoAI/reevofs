@@ -1,6 +1,6 @@
 //! ReevoFS — FUSE filesystem backed by the Reevo API.
 
-mod api;
+use reevofs_api::ReevoClient;
 #[cfg(feature = "fuse")]
 mod fs;
 
@@ -31,8 +31,8 @@ struct Cli {
 }
 
 impl Cli {
-    fn client(&self) -> api::ReevoClient {
-        api::ReevoClient::with_ids(
+    fn client(&self) -> ReevoClient {
+        ReevoClient::with_ids(
             &self.api_url,
             &self.token,
             self.user_id.as_deref(),

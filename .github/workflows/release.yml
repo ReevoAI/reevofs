@@ -20,10 +20,10 @@ jobs:
         include:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            artifact: reevofs-linux-arm64
+            suffix: linux-arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
-            artifact: reevofs-linux-amd64
+            suffix: linux-amd64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,17 +36,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev pkg-config
 
-      - name: Build release binary
+      - name: Build release binaries
         run: cargo build --release --features fuse
 
-      - name: Rename binary
-        run: cp target/release/reevofs ${{ matrix.artifact }}
+      - name: Rename artifacts
+        run: |
+          cp target/release/reevofs reevofs-${{ matrix.suffix }}
+          cp target/release/libreevofs_preload.so libreevofs_preload-${{ matrix.suffix }}.so
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: binaries-${{ matrix.suffix }}
+          path: |
+            reevofs-${{ matrix.suffix }}
+            libreevofs_preload-${{ matrix.suffix }}.so
 
   release:
     needs: build
@@ -73,5 +77,7 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           files: |
-            reevofs-linux-arm64/reevofs-linux-arm64
-            reevofs-linux-amd64/reevofs-linux-amd64
+            binaries-linux-arm64/reevofs-linux-arm64
+            binaries-linux-arm64/libreevofs_preload-linux-arm64.so
+            binaries-linux-amd64/reevofs-linux-amd64
+            binaries-linux-amd64/libreevofs_preload-linux-amd64.so
