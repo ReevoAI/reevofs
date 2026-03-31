@@ -3,6 +3,8 @@
 //!
 //! Uses thread-local re-entrancy guard to prevent recursive interception
 //! when the HTTP client itself calls libc functions.
+//! The guard is checked BEFORE accessing Lazy<Config> to avoid deadlock
+//! during config initialization (reqwest calls open/read for TLS certs).
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -16,8 +18,12 @@ use once_cell::sync::Lazy;
 use reevofs_api::ReevoClient;
 
 // ---------------------------------------------------------------------------
-// Re-entrancy guard — prevents infinite recursion when our HTTP client
-// calls open()/read() internally (e.g. for DNS, TLS certs)
+// Re-entrancy guard — prevents infinite recursion AND deadlock.
+//
+// Must be checked BEFORE any Lazy access, because Lazy::new holds an
+// internal lock while running its init closure. If reqwest (inside that
+// closure) calls open() → match_path() → CONFIG.as_ref(), it deadlocks
+// trying to re-acquire the same Lazy lock on the same thread.
 // ---------------------------------------------------------------------------
 
 thread_local! {
@@ -49,6 +55,9 @@ impl Drop for ReentrancyGuard {
 // Config
 // ---------------------------------------------------------------------------
 
+/// Hard-coded default prefix for fast pre-check without touching Lazy.
+const DEFAULT_PREFIX: &str = "/reevofs";
+
 struct Config {
     prefix: String,
     namespace: String,
@@ -57,11 +66,15 @@ struct Config {
 }
 
 static CONFIG: Lazy<Option<Config>> = Lazy::new(|| {
+    // Re-entrancy guard during init: reqwest will call open()/read()
+    // for TLS certs, DNS, etc. Those calls must pass through to real libc.
+    let _guard = ReentrancyGuard::try_enter();
+
     let api_url = std::env::var("REEVO_API_URL").ok()?;
     let token = std::env::var("REEVO_API_TOKEN").unwrap_or_default();
     let user_id = std::env::var("REEVO_USER_ID").ok();
     let org_id = std::env::var("REEVO_ORG_ID").ok();
-    let prefix = std::env::var("REEVOFS_MOUNT_PREFIX").unwrap_or_else(|_| "/reevofs".into());
+    let prefix = std::env::var("REEVOFS_MOUNT_PREFIX").unwrap_or_else(|_| DEFAULT_PREFIX.into());
     let namespace = std::env::var("REEVOFS_NAMESPACE").unwrap_or_else(|_| "skills".into());
     let scope = std::env::var("REEVOFS_SCOPE").unwrap_or_else(|_| "org".into());
 
@@ -72,6 +85,12 @@ static CONFIG: Lazy<Option<Config>> = Lazy::new(|| {
         client: ReevoClient::with_ids(&api_url, &token, user_id.as_deref(), org_id.as_deref()),
     })
 });
+
+/// Fast path check: does this path start with the reevofs prefix?
+/// Uses the hard-coded default for a cheap pre-check before touching Lazy.
+fn quick_prefix_match(path_str: &str) -> bool {
+    path_str.starts_with(DEFAULT_PREFIX)
+}
 
 fn match_path(path_str: &str) -> Option<(&'static Config, &str)> {
     let cfg = CONFIG.as_ref()?;
@@ -124,7 +143,7 @@ fn set_errno(err: c_int) {
 }
 
 // ---------------------------------------------------------------------------
-// open
+// open — guard FIRST, then cheap prefix check, then Lazy access
 // ---------------------------------------------------------------------------
 
 unsafe fn do_open(path: *const c_char, flags: c_int, mode: libc::mode_t, sym: &[u8]) -> c_int {
@@ -133,14 +152,16 @@ unsafe fn do_open(path: *const c_char, flags: c_int, mode: libc::mode_t, sym: &[
 
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
-            if let Some((cfg, api_path)) = match_path(s) {
+            if quick_prefix_match(s) {
+                // Re-entrancy guard BEFORE touching CONFIG
                 if let Some(_guard) = ReentrancyGuard::try_enter() {
-                    return match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-                        Ok(resp) => alloc_vfd(resp.content.into_bytes()),
-                        Err(_) => { set_errno(libc::ENOENT); -1 }
-                    };
+                    if let Some((cfg, api_path)) = match_path(s) {
+                        return match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
+                            Ok(resp) => alloc_vfd(resp.content.into_bytes()),
+                            Err(_) => { set_errno(libc::ENOENT); -1 }
+                        };
+                    }
                 }
-                // Re-entrant call — fall through to real open (won't match a real path)
             }
         }
     }
@@ -158,7 +179,7 @@ pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::m
 }
 
 // ---------------------------------------------------------------------------
-// read / close — only intercept virtual FDs
+// read / close — only intercept virtual FDs (no guard needed)
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
@@ -194,29 +215,31 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
-// stat / lstat / access — only intercept /reevofs/* paths
+// stat / lstat / access — guard FIRST, then prefix check
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
-            if let Some((cfg, api_path)) = match_path(s) {
+            if quick_prefix_match(s) {
                 if let Some(_guard) = ReentrancyGuard::try_enter() {
-                    std::ptr::write_bytes(buf, 0, 1);
-                    if let Ok(resp) = cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-                        (*buf).st_mode = libc::S_IFREG | 0o644;
-                        (*buf).st_size = resp.content.len() as libc::off_t;
-                        (*buf).st_nlink = 1;
-                        return 0;
+                    if let Some((cfg, api_path)) = match_path(s) {
+                        std::ptr::write_bytes(buf, 0, 1);
+                        if let Ok(resp) = cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
+                            (*buf).st_mode = libc::S_IFREG | 0o644;
+                            (*buf).st_size = resp.content.len() as libc::off_t;
+                            (*buf).st_nlink = 1;
+                            return 0;
+                        }
+                        if cfg.client.list_dir(&cfg.namespace, &cfg.scope, api_path).is_ok() {
+                            (*buf).st_mode = libc::S_IFDIR | 0o755;
+                            (*buf).st_nlink = 2;
+                            return 0;
+                        }
+                        set_errno(libc::ENOENT);
+                        return -1;
                     }
-                    if cfg.client.list_dir(&cfg.namespace, &cfg.scope, api_path).is_ok() {
-                        (*buf).st_mode = libc::S_IFDIR | 0o755;
-                        (*buf).st_nlink = 2;
-                        return 0;
-                    }
-                    set_errno(libc::ENOENT);
-                    return -1;
                 }
             }
         }
@@ -235,7 +258,7 @@ pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_i
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
-            if match_path(s).is_some() {
+            if quick_prefix_match(s) {
                 return 0;
             }
         }
