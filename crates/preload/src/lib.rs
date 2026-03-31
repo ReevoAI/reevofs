@@ -1,10 +1,8 @@
-//! LD_PRELOAD shim — intercepts open/read/stat/close for /reevofs/* paths.
+//! LD_PRELOAD shim — intercepts file ops for /reevofs/* paths.
 //! All other paths pass through with zero overhead.
 //!
-//! Uses thread-local re-entrancy guard to prevent recursive interception
-//! when the HTTP client itself calls libc functions.
-//! The guard is checked BEFORE accessing Lazy<Config> to avoid deadlock
-//! during config initialization (reqwest calls open/read for TLS certs).
+//! Intercepts: openat, open, open64, read, close, fstatat, stat, lstat, access
+//! Modern glibc uses openat/fstatat instead of open/stat, so both are needed.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -18,12 +16,7 @@ use once_cell::sync::Lazy;
 use reevofs_api::ReevoClient;
 
 // ---------------------------------------------------------------------------
-// Re-entrancy guard — prevents infinite recursion AND deadlock.
-//
-// Must be checked BEFORE any Lazy access, because Lazy::new holds an
-// internal lock while running its init closure. If reqwest (inside that
-// closure) calls open() → match_path() → CONFIG.as_ref(), it deadlocks
-// trying to re-acquire the same Lazy lock on the same thread.
+// Re-entrancy guard
 // ---------------------------------------------------------------------------
 
 thread_local! {
@@ -36,7 +29,7 @@ impl ReentrancyGuard {
     fn try_enter() -> Option<Self> {
         IN_HOOK.with(|flag| {
             if flag.get() {
-                None // Already inside a hook — pass through
+                None
             } else {
                 flag.set(true);
                 Some(ReentrancyGuard)
@@ -55,7 +48,6 @@ impl Drop for ReentrancyGuard {
 // Config
 // ---------------------------------------------------------------------------
 
-/// Hard-coded default prefix for fast pre-check without touching Lazy.
 const DEFAULT_PREFIX: &str = "/reevofs";
 
 struct Config {
@@ -66,8 +58,6 @@ struct Config {
 }
 
 static CONFIG: Lazy<Option<Config>> = Lazy::new(|| {
-    // Re-entrancy guard during init: reqwest will call open()/read()
-    // for TLS certs, DNS, etc. Those calls must pass through to real libc.
     let _guard = ReentrancyGuard::try_enter();
 
     let api_url = std::env::var("REEVO_API_URL").ok()?;
@@ -86,8 +76,6 @@ static CONFIG: Lazy<Option<Config>> = Lazy::new(|| {
     })
 });
 
-/// Fast path check: does this path start with the reevofs prefix?
-/// Uses the hard-coded default for a cheap pre-check before touching Lazy.
 fn quick_prefix_match(path_str: &str) -> bool {
     path_str.starts_with(DEFAULT_PREFIX)
 }
@@ -143,28 +131,59 @@ fn set_errno(err: c_int) {
 }
 
 // ---------------------------------------------------------------------------
-// open — guard FIRST, then cheap prefix check, then Lazy access
+// Core open logic — shared by open, open64, openat
 // ---------------------------------------------------------------------------
 
-unsafe fn do_open(path: *const c_char, flags: c_int, mode: libc::mode_t, sym: &[u8]) -> c_int {
-    type F = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
-    let real: F = std::mem::transmute(dlsym_next(sym));
+fn try_open_reevofs(path_str: &str) -> Option<c_int> {
+    if !quick_prefix_match(path_str) {
+        return None;
+    }
+    let _guard = ReentrancyGuard::try_enter()?;
+    let (cfg, api_path) = match_path(path_str)?;
+    match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
+        Ok(resp) => Some(alloc_vfd(resp.content.into_bytes())),
+        Err(_) => {
+            set_errno(libc::ENOENT);
+            Some(-1)
+        }
+    }
+}
 
+// ---------------------------------------------------------------------------
+// openat — this is what modern glibc/Python actually uses
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
-            if quick_prefix_match(s) {
-                // Re-entrancy guard BEFORE touching CONFIG
-                if let Some(_guard) = ReentrancyGuard::try_enter() {
-                    if let Some((cfg, api_path)) = match_path(s) {
-                        return match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-                            Ok(resp) => alloc_vfd(resp.content.into_bytes()),
-                            Err(_) => { set_errno(libc::ENOENT); -1 }
-                        };
-                    }
+            // Only intercept absolute paths (dirfd is ignored for absolute paths)
+            if s.starts_with('/') {
+                if let Some(result) = try_open_reevofs(s) {
+                    return result;
                 }
             }
         }
     }
+    type F = unsafe extern "C" fn(c_int, *const c_char, c_int, libc::mode_t) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"openat\0"));
+    real(dirfd, path, flags, mode)
+}
+
+// ---------------------------------------------------------------------------
+// open / open64 — legacy, but still used by some programs
+// ---------------------------------------------------------------------------
+
+unsafe fn do_open(path: *const c_char, flags: c_int, mode: libc::mode_t, sym: &[u8]) -> c_int {
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if let Some(result) = try_open_reevofs(s) {
+                return result;
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(sym));
     real(path, flags, mode)
 }
 
@@ -179,7 +198,7 @@ pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::m
 }
 
 // ---------------------------------------------------------------------------
-// read / close — only intercept virtual FDs (no guard needed)
+// read / close — only intercept virtual FDs
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
@@ -215,32 +234,77 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
-// stat / lstat / access — guard FIRST, then prefix check
+// fstatat (aka newfstatat) — what modern glibc/Python uses for stat()
+// Also intercept __xstat for older glibc
 // ---------------------------------------------------------------------------
+
+fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
+    if !quick_prefix_match(path_str) {
+        return None;
+    }
+    let _guard = ReentrancyGuard::try_enter()?;
+    let (cfg, api_path) = match_path(path_str)?;
+
+    unsafe { std::ptr::write_bytes(buf, 0, 1); }
+
+    if let Ok(resp) = cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
+        unsafe {
+            (*buf).st_mode = libc::S_IFREG | 0o644;
+            (*buf).st_size = resp.content.len() as libc::off_t;
+            (*buf).st_nlink = 1;
+        }
+        return Some(0);
+    }
+    if cfg.client.list_dir(&cfg.namespace, &cfg.scope, api_path).is_ok() {
+        unsafe {
+            (*buf).st_mode = libc::S_IFDIR | 0o755;
+            (*buf).st_nlink = 2;
+        }
+        return Some(0);
+    }
+    set_errno(libc::ENOENT);
+    Some(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fstatat(dirfd: c_int, path: *const c_char, buf: *mut libc::stat, flag: c_int) -> c_int {
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if s.starts_with('/') {
+                if let Some(result) = try_stat_reevofs(s, buf) {
+                    return result;
+                }
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat, c_int) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"fstatat\0"));
+    real(dirfd, path, buf, flag)
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __fxstatat(ver: c_int, dirfd: c_int, path: *const c_char, buf: *mut libc::stat, flag: c_int) -> c_int {
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if s.starts_with('/') {
+                if let Some(result) = try_stat_reevofs(s, buf) {
+                    return result;
+                }
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(c_int, c_int, *const c_char, *mut libc::stat, c_int) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"__fxstatat\0"));
+    real(ver, dirfd, path, buf, flag)
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
-            if quick_prefix_match(s) {
-                if let Some(_guard) = ReentrancyGuard::try_enter() {
-                    if let Some((cfg, api_path)) = match_path(s) {
-                        std::ptr::write_bytes(buf, 0, 1);
-                        if let Ok(resp) = cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-                            (*buf).st_mode = libc::S_IFREG | 0o644;
-                            (*buf).st_size = resp.content.len() as libc::off_t;
-                            (*buf).st_nlink = 1;
-                            return 0;
-                        }
-                        if cfg.client.list_dir(&cfg.namespace, &cfg.scope, api_path).is_ok() {
-                            (*buf).st_mode = libc::S_IFDIR | 0o755;
-                            (*buf).st_nlink = 2;
-                            return 0;
-                        }
-                        set_errno(libc::ENOENT);
-                        return -1;
-                    }
-                }
+            if let Some(result) = try_stat_reevofs(s, buf) {
+                return result;
             }
         }
     }
@@ -251,8 +315,51 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_in
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut libc::stat) -> c_int {
-    stat(path, buf)
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if let Some(result) = try_stat_reevofs(s, buf) {
+                return result;
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"lstat\0"));
+    real(path, buf)
 }
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut libc::stat) -> c_int {
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if let Some(result) = try_stat_reevofs(s, buf) {
+                return result;
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"__xstat\0"));
+    real(ver, path, buf)
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut libc::stat) -> c_int {
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if let Some(result) = try_stat_reevofs(s, buf) {
+                return result;
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"__lxstat\0"));
+    real(ver, path, buf)
+}
+
+// ---------------------------------------------------------------------------
+// access
+// ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
@@ -266,4 +373,18 @@ pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     type F = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
     let real: F = std::mem::transmute(dlsym_next(b"access\0"));
     real(path, mode)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int {
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if s.starts_with('/') && quick_prefix_match(s) {
+                return 0;
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"faccessat\0"));
+    real(dirfd, path, mode, flags)
 }
