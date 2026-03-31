@@ -381,3 +381,43 @@ pub unsafe extern "C" fn faccessat(dirfd: c_int, path: *const c_char, mode: c_in
     let real: F = std::mem::transmute(dlsym_next(b"faccessat\0"));
     real(dirfd, path, mode, flags)
 }
+
+// ---------------------------------------------------------------------------
+// 64-bit stat variants — CPython on aarch64 glibc 2.33+ uses these
+// On modern Linux, stat64 == stat (both use 64-bit fields), but glibc
+// exports them as separate symbols with version tags.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fstatat64(dirfd: c_int, path: *const c_char, buf: *mut libc::stat, flag: c_int) -> c_int {
+    fstatat(dirfd, path, buf, flag)
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut libc::stat) -> c_int {
+    stat(path, buf)
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut libc::stat) -> c_int {
+    lstat(path, buf)
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut libc::stat) -> c_int {
+    // This wraps the kernel fstat for completeness — real FDs pass through
+    type F = unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"fstat64\0"));
+    real(fd, buf)
+}
+
+// Also hook openat64 which some programs use
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openat64(dirfd: c_int, path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+    openat(dirfd, path, flags, mode)
+}
