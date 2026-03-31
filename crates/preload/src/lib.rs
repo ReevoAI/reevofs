@@ -388,3 +388,37 @@ pub unsafe extern "C" fn faccessat(dirfd: c_int, path: *const c_char, mode: c_in
     let real: F = std::mem::transmute(dlsym_next(b"faccessat\0"));
     real(dirfd, path, mode, flags)
 }
+
+// ---------------------------------------------------------------------------
+// fstat — Python calls fstat(fd) right after openat() returns our VFD
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
+    if is_virtual_fd(fd) {
+        let fds = VIRTUAL_FDS.lock().unwrap();
+        if let Some(vf) = fds.get(&fd) {
+            std::ptr::write_bytes(buf, 0, 1);
+            (*buf).st_mode = libc::S_IFREG | 0o644;
+            (*buf).st_size = vf.content.len() as libc::off_t;
+            (*buf).st_nlink = 1;
+            return 0;
+        }
+        set_errno(libc::EBADF);
+        return -1;
+    }
+    type F = unsafe extern "C" fn(c_int, *mut libc::stat) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"fstat\0"));
+    real(fd, buf)
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __fxstat(ver: c_int, fd: c_int, buf: *mut libc::stat) -> c_int {
+    if is_virtual_fd(fd) {
+        return fstat(fd, buf);
+    }
+    type F = unsafe extern "C" fn(c_int, c_int, *mut libc::stat) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"__fxstat\0"));
+    real(ver, fd, buf)
+}
