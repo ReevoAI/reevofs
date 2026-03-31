@@ -1,20 +1,12 @@
-//! LD_PRELOAD shim that intercepts libc filesystem calls and redirects
-//! paths under a configurable prefix (default `/reevofs/`) to the Reevo API.
+//! LD_PRELOAD shim — intercepts open/read/stat/close for /reevofs/* paths.
+//! All other paths pass through with zero overhead.
 //!
-//! Only intercepts calls where the path starts with the prefix.
-//! All other calls pass through to the real libc with zero overhead.
-//!
-//! Usage:
-//!   LD_PRELOAD=/usr/local/lib/libreevofs_preload.so some_command
-//!
-//! Environment variables:
-//!   REEVO_API_URL, REEVO_API_TOKEN, REEVO_USER_ID, REEVO_ORG_ID
-//!   REEVOFS_MOUNT_PREFIX (default: /reevofs)
-//!   REEVOFS_NAMESPACE (default: skills)
-//!   REEVOFS_SCOPE (default: org)
+//! Uses thread-local re-entrancy guard to prevent recursive interception
+//! when the HTTP client itself calls libc functions.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
@@ -22,6 +14,36 @@ use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 use reevofs_api::ReevoClient;
+
+// ---------------------------------------------------------------------------
+// Re-entrancy guard — prevents infinite recursion when our HTTP client
+// calls open()/read() internally (e.g. for DNS, TLS certs)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+struct ReentrancyGuard;
+
+impl ReentrancyGuard {
+    fn try_enter() -> Option<Self> {
+        IN_HOOK.with(|flag| {
+            if flag.get() {
+                None // Already inside a hook — pass through
+            } else {
+                flag.set(true);
+                Some(ReentrancyGuard)
+            }
+        })
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        IN_HOOK.with(|flag| flag.set(false));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -51,7 +73,6 @@ static CONFIG: Lazy<Option<Config>> = Lazy::new(|| {
     })
 });
 
-/// If path starts with our prefix, strip it and return the API path.
 fn match_path(path_str: &str) -> Option<(&'static Config, &str)> {
     let cfg = CONFIG.as_ref()?;
     if path_str.starts_with(&cfg.prefix) {
@@ -71,7 +92,7 @@ unsafe fn dlsym_next(name: &[u8]) -> *mut c_void {
 }
 
 // ---------------------------------------------------------------------------
-// Virtual FD table — uses high positive fds (900_000+) to avoid collisions
+// Virtual FD table (900_000+ range)
 // ---------------------------------------------------------------------------
 
 struct VirtualFile {
@@ -81,7 +102,6 @@ struct VirtualFile {
 
 static VIRTUAL_FDS: Lazy<Mutex<HashMap<c_int, VirtualFile>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-
 static NEXT_VFD: Lazy<Mutex<c_int>> = Lazy::new(|| Mutex::new(900_000));
 
 fn alloc_vfd(content: Vec<u8>) -> c_int {
@@ -92,9 +112,7 @@ fn alloc_vfd(content: Vec<u8>) -> c_int {
     fd
 }
 
-fn is_virtual_fd(fd: c_int) -> bool {
-    fd >= 900_000
-}
+fn is_virtual_fd(fd: c_int) -> bool { fd >= 900_000 }
 
 fn set_errno(err: c_int) {
     unsafe {
@@ -106,42 +124,42 @@ fn set_errno(err: c_int) {
 }
 
 // ---------------------------------------------------------------------------
-// Intercepted functions — only touch /reevofs/* paths
+// open
 // ---------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+unsafe fn do_open(path: *const c_char, flags: c_int, mode: libc::mode_t, sym: &[u8]) -> c_int {
+    type F = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(sym));
+
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
             if let Some((cfg, api_path)) = match_path(s) {
-                return match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-                    Ok(resp) => alloc_vfd(resp.content.into_bytes()),
-                    Err(_) => { set_errno(libc::ENOENT); -1 }
-                };
+                if let Some(_guard) = ReentrancyGuard::try_enter() {
+                    return match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
+                        Ok(resp) => alloc_vfd(resp.content.into_bytes()),
+                        Err(_) => { set_errno(libc::ENOENT); -1 }
+                    };
+                }
+                // Re-entrant call — fall through to real open (won't match a real path)
             }
         }
     }
-    type F = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
-    let real: F = std::mem::transmute(dlsym_next(b"open64\0"));
     real(path, flags, mode)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
-    if !path.is_null() {
-        if let Ok(s) = CStr::from_ptr(path).to_str() {
-            if let Some((cfg, api_path)) = match_path(s) {
-                return match cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-                    Ok(resp) => alloc_vfd(resp.content.into_bytes()),
-                    Err(_) => { set_errno(libc::ENOENT); -1 }
-                };
-            }
-        }
-    }
-    type F = unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int;
-    let real: F = std::mem::transmute(dlsym_next(b"open\0"));
-    real(path, flags, mode)
+    do_open(path, flags, mode, b"open\0")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
+    do_open(path, flags, mode, b"open64\0")
+}
+
+// ---------------------------------------------------------------------------
+// read / close — only intercept virtual FDs
+// ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: libc::size_t) -> libc::ssize_t {
@@ -175,27 +193,31 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     real(fd)
 }
 
+// ---------------------------------------------------------------------------
+// stat / lstat / access — only intercept /reevofs/* paths
+// ---------------------------------------------------------------------------
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
     if !path.is_null() {
         if let Ok(s) = CStr::from_ptr(path).to_str() {
             if let Some((cfg, api_path)) = match_path(s) {
-                std::ptr::write_bytes(buf, 0, 1);
-                // Try as file
-                if let Ok(resp) = cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
-                    (*buf).st_mode = libc::S_IFREG | 0o644;
-                    (*buf).st_size = resp.content.len() as libc::off_t;
-                    (*buf).st_nlink = 1;
-                    return 0;
+                if let Some(_guard) = ReentrancyGuard::try_enter() {
+                    std::ptr::write_bytes(buf, 0, 1);
+                    if let Ok(resp) = cfg.client.read_file(&cfg.namespace, &cfg.scope, api_path) {
+                        (*buf).st_mode = libc::S_IFREG | 0o644;
+                        (*buf).st_size = resp.content.len() as libc::off_t;
+                        (*buf).st_nlink = 1;
+                        return 0;
+                    }
+                    if cfg.client.list_dir(&cfg.namespace, &cfg.scope, api_path).is_ok() {
+                        (*buf).st_mode = libc::S_IFDIR | 0o755;
+                        (*buf).st_nlink = 2;
+                        return 0;
+                    }
+                    set_errno(libc::ENOENT);
+                    return -1;
                 }
-                // Try as directory
-                if cfg.client.list_dir(&cfg.namespace, &cfg.scope, api_path).is_ok() {
-                    (*buf).st_mode = libc::S_IFDIR | 0o755;
-                    (*buf).st_nlink = 2;
-                    return 0;
-                }
-                set_errno(libc::ENOENT);
-                return -1;
             }
         }
     }
