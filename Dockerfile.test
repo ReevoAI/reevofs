@@ -1,0 +1,19 @@
+FROM rust:1.93-slim-bookworm
+
+RUN apt-get update && apt-get install -y \
+    fuse3 libfuse3-dev pkg-config cmake g++ python3 nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+# Build the shim .so in release mode
+RUN cargo build --release -p reevofs-preload 2>&1
+
+# Run tests: start mock API, then run integration test with LD_PRELOAD
+CMD ["bash", "-c", "\
+    python3 tests/mock_api.py 9876 & \
+    sleep 1 && \
+    REEVOFS_PRELOAD_LIB=/app/target/release/libreevofs_preload.so \
+    bash tests/integration_test.sh \
+"]
