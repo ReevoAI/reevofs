@@ -482,6 +482,161 @@ catch(e) { console.log('not writable'); }
 assert_eq "node accessSync writable" "writable" "$OUT"
 
 # ═══════════════════════════════════════════════════════════════════════
+echo "=== 13. rename / mv ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# First create a file to rename
+run bash -c 'echo "rename me" > /reevofs/output/before_rename.txt'
+OUT=$(run cat /reevofs/output/before_rename.txt 2>/dev/null)
+assert_eq "create file for rename" "rename me" "$OUT"
+
+# mv within same namespace
+run mv /reevofs/output/before_rename.txt /reevofs/output/after_rename.txt 2>/dev/null
+OUT=$(run cat /reevofs/output/after_rename.txt 2>/dev/null)
+assert_eq "mv read destination" "rename me" "$OUT"
+
+# Source should be gone
+if run cat /reevofs/output/before_rename.txt 2>/dev/null; then
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: mv source removed (source still exists)"
+    echo "  FAIL: mv source removed"
+else
+    PASS=$((PASS + 1))
+    echo "  PASS: mv source removed"
+fi
+
+# Python os.rename
+run python3 -c "
+import os
+# Create a file to rename
+with open('/reevofs/output/py_rename_src.txt', 'w') as f:
+    f.write('python rename test')
+os.rename('/reevofs/output/py_rename_src.txt', '/reevofs/output/py_rename_dst.txt')
+" 2>/dev/null
+OUT=$(run cat /reevofs/output/py_rename_dst.txt 2>/dev/null)
+assert_eq "python os.rename" "python rename test" "$OUT"
+
+# Python source should be gone
+OUT=$(run python3 -c "
+import os
+print(os.path.exists('/reevofs/output/py_rename_src.txt'))
+" 2>/dev/null)
+assert_eq "python rename source gone" "False" "$OUT"
+
+# Node.js fs.renameSync
+OUT=$(run timeout 10 node -e "
+const fs = require('fs');
+fs.writeFileSync('/reevofs/output/node_rename_src.txt', 'node rename test');
+fs.renameSync('/reevofs/output/node_rename_src.txt', '/reevofs/output/node_rename_dst.txt');
+console.log(fs.readFileSync('/reevofs/output/node_rename_dst.txt', 'utf8'));
+console.log(fs.existsSync('/reevofs/output/node_rename_src.txt'));
+" 2>/dev/null)
+assert_eq "node renameSync" "node rename test
+false" "$OUT"
+
+# Rename from read-only namespace should fail
+if run mv /reevofs/skills/hello.txt /reevofs/skills/hello2.txt 2>/dev/null; then
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: rename read-only should fail (got success)"
+    echo "  FAIL: rename read-only should fail"
+else
+    PASS=$((PASS + 1))
+    echo "  PASS: rename read-only should fail"
+fi
+
+# Cross-namespace rename: read-only source → writable dest (copy-style)
+run bash -c 'cp /reevofs/skills/hello.txt /tmp/hello_snap.txt && mv /tmp/hello_snap.txt /reevofs/output/cross_ns.txt' 2>/dev/null || true
+# Direct cross-namespace mv (source not deleted since read-only)
+run mv /reevofs/skills/hello.txt /reevofs/output/cross_ns_direct.txt 2>/dev/null || true
+OUT=$(run cat /reevofs/output/cross_ns_direct.txt 2>/dev/null)
+assert_eq "cross-ns rename destination" "hello world" "$OUT"
+# Source should still exist (read-only, can't delete)
+OUT=$(run cat /reevofs/skills/hello.txt 2>/dev/null)
+assert_eq "cross-ns rename source preserved" "hello world" "$OUT"
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== 14. Benchmarks ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+bench() {
+    local name="$1"
+    shift
+    local start end elapsed
+    start=$(date +%s%N)
+    "$@" > /dev/null 2>&1 || true
+    end=$(date +%s%N)
+    elapsed=$(( (end - start) / 1000000 ))
+    echo "  BENCH: ${name} = ${elapsed}ms"
+}
+
+echo "--- Single operation latency ---"
+bench "stat (cached)"         run stat /reevofs/skills/hello.txt
+bench "stat (cached repeat)"  run stat /reevofs/skills/hello.txt
+bench "cat small file"        run cat /reevofs/skills/hello.txt
+bench "cat small (repeat)"    run cat /reevofs/skills/hello.txt
+bench "ls directory"          run ls /reevofs/skills/
+bench "ls directory (repeat)" run ls /reevofs/skills/
+bench "access check"          run test -f /reevofs/skills/hello.txt
+bench "write small file"      run bash -c 'echo bench > /reevofs/output/bench_write.txt'
+bench "read after write"      run cat /reevofs/output/bench_write.txt
+bench "rename file"           run mv /reevofs/output/bench_write.txt /reevofs/output/bench_renamed.txt
+bench "delete file"           run rm /reevofs/output/bench_renamed.txt
+
+echo ""
+echo "--- Bulk operations ---"
+
+# Write 20 files
+start_bulk=$(date +%s%N)
+for i in $(seq 1 20); do
+    run bash -c "echo 'file $i content' > /reevofs/output/bulk_${i}.txt" 2>/dev/null
+done
+end_bulk=$(date +%s%N)
+elapsed_bulk=$(( (end_bulk - start_bulk) / 1000000 ))
+echo "  BENCH: write 20 files = ${elapsed_bulk}ms (avg $(( elapsed_bulk / 20 ))ms/file)"
+
+# Read 20 files
+start_bulk=$(date +%s%N)
+for i in $(seq 1 20); do
+    run cat /reevofs/output/bulk_${i}.txt > /dev/null 2>&1
+done
+end_bulk=$(date +%s%N)
+elapsed_bulk=$(( (end_bulk - start_bulk) / 1000000 ))
+echo "  BENCH: read 20 files = ${elapsed_bulk}ms (avg $(( elapsed_bulk / 20 ))ms/file)"
+
+# Stat 20 files (distinct)
+start_bulk=$(date +%s%N)
+for i in $(seq 1 20); do
+    run stat /reevofs/output/bulk_${i}.txt > /dev/null 2>&1
+done
+end_bulk=$(date +%s%N)
+elapsed_bulk=$(( (end_bulk - start_bulk) / 1000000 ))
+echo "  BENCH: stat 20 files = ${elapsed_bulk}ms (avg $(( elapsed_bulk / 20 ))ms/file)"
+
+# Stat same file 20x (should be fully cached after first)
+start_bulk=$(date +%s%N)
+for i in $(seq 1 20); do
+    run stat /reevofs/output/bulk_1.txt > /dev/null 2>&1
+done
+end_bulk=$(date +%s%N)
+elapsed_bulk=$(( (end_bulk - start_bulk) / 1000000 ))
+echo "  BENCH: stat same file 20x (cached) = ${elapsed_bulk}ms (avg $(( elapsed_bulk / 20 ))ms/op)"
+
+# Python: read + stat in a single process (amortizes shim init)
+bench "python read+stat 10 files" run python3 -c "
+import os
+for i in range(1, 11):
+    p = f'/reevofs/output/bulk_{i}.txt'
+    os.stat(p)
+    open(p).read()
+"
+
+# Cleanup bulk files
+for i in $(seq 1 20); do
+    run rm /reevofs/output/bulk_${i}.txt > /dev/null 2>&1 || true
+done
+
+# ═══════════════════════════════════════════════════════════════════════
 echo ""
 echo "==========================================="
 echo "Results: $PASS passed, $FAIL failed"

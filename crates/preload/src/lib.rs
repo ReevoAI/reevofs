@@ -1726,6 +1726,132 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: libc::mode_t) -> c_int
 }
 
 // ---------------------------------------------------------------------------
+// Core rename logic — implemented as read→write→delete (no server-side rename API)
+// ---------------------------------------------------------------------------
+
+fn try_rename_reevofs(old_path: &str, new_path: &str) -> Option<c_int> {
+    // Both paths must be under /reevofs/
+    if !quick_prefix_match(old_path) || !quick_prefix_match(new_path) {
+        return None;
+    }
+    let _guard = ReentrancyGuard::try_enter()?;
+    let (cfg, src_ns_cfg, src_ns, src_api_path) = match_path(old_path)?;
+    let (_cfg2, dst_ns_cfg, dst_ns, dst_api_path) = match_path(new_path)?;
+
+    // Source must be readable, destination must be writable.
+    if dst_ns_cfg.access != Access::ReadWrite {
+        set_errno(libc::EACCES);
+        return Some(-1);
+    }
+
+    // Read source content.
+    let content = match cfg.client.read_file(src_ns, &src_ns_cfg.scope, src_api_path) {
+        Ok(resp) => resp.content,
+        Err(_) => {
+            set_errno(libc::ENOENT);
+            return Some(-1);
+        }
+    };
+
+    // Write to destination.
+    if cfg.client.write_file(dst_ns, &dst_ns_cfg.scope, dst_api_path, &content).is_err() {
+        set_errno(libc::EIO);
+        return Some(-1);
+    }
+    invalidate_path(dst_ns, &dst_ns_cfg.scope, dst_api_path);
+
+    // Delete source (only if source namespace is writable).
+    if src_ns_cfg.access == Access::ReadWrite {
+        let _ = cfg.client.delete_file(src_ns, &src_ns_cfg.scope, src_api_path);
+        invalidate_path(src_ns, &src_ns_cfg.scope, src_api_path);
+    }
+
+    Some(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn renameat2(
+    olddirfd: c_int, oldpath: *const c_char,
+    newdirfd: c_int, newpath: *const c_char,
+    _flags: libc::c_uint,
+) -> c_int {
+    if !oldpath.is_null() && !newpath.is_null() {
+        if let (Ok(old_s), Ok(new_s)) = (
+            CStr::from_ptr(oldpath).to_str(),
+            CStr::from_ptr(newpath).to_str(),
+        ) {
+            let old_full = if old_s.starts_with('/') {
+                Some(old_s.to_string())
+            } else {
+                resolve_dirfd(olddirfd, old_s)
+            };
+            let new_full = if new_s.starts_with('/') {
+                Some(new_s.to_string())
+            } else {
+                resolve_dirfd(newdirfd, new_s)
+            };
+            if let (Some(ref o), Some(ref n)) = (old_full, new_full) {
+                if let Some(result) = try_rename_reevofs(o, n) {
+                    return result;
+                }
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, libc::c_uint) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"renameat2\0"));
+    real(olddirfd, oldpath, newdirfd, newpath, _flags)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn renameat(
+    olddirfd: c_int, oldpath: *const c_char,
+    newdirfd: c_int, newpath: *const c_char,
+) -> c_int {
+    if !oldpath.is_null() && !newpath.is_null() {
+        if let (Ok(old_s), Ok(new_s)) = (
+            CStr::from_ptr(oldpath).to_str(),
+            CStr::from_ptr(newpath).to_str(),
+        ) {
+            let old_full = if old_s.starts_with('/') {
+                Some(old_s.to_string())
+            } else {
+                resolve_dirfd(olddirfd, old_s)
+            };
+            let new_full = if new_s.starts_with('/') {
+                Some(new_s.to_string())
+            } else {
+                resolve_dirfd(newdirfd, new_s)
+            };
+            if let (Some(ref o), Some(ref n)) = (old_full, new_full) {
+                if let Some(result) = try_rename_reevofs(o, n) {
+                    return result;
+                }
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"renameat\0"));
+    real(olddirfd, oldpath, newdirfd, newpath)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int {
+    if !oldpath.is_null() && !newpath.is_null() {
+        if let (Ok(old_s), Ok(new_s)) = (
+            CStr::from_ptr(oldpath).to_str(),
+            CStr::from_ptr(newpath).to_str(),
+        ) {
+            if let Some(result) = try_rename_reevofs(old_s, new_s) {
+                return result;
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"rename\0"));
+    real(oldpath, newpath)
+}
+
+// ---------------------------------------------------------------------------
 // 64-bit variants — CPython on aarch64 glibc 2.33+ uses fstatat64, stat64, etc.
 // Each has its own dlsym fallback to avoid circular calls.
 // ---------------------------------------------------------------------------
@@ -1949,6 +2075,37 @@ pub unsafe extern "C" fn syscall(
                     *offset += copied;
                 }
                 return copied as libc::c_long;
+            }
+        }
+    }
+
+    // SYS_renameat2 — intercept rename via raw syscall.
+    // syscall(SYS_renameat2, olddirfd, oldpath, newdirfd, newpath, flags)
+    if number == libc::SYS_renameat2 {
+        let olddirfd = a1 as c_int;
+        let oldpath_ptr = a2 as *const c_char;
+        let newdirfd = a3 as c_int;
+        let newpath_ptr = a4 as *const c_char;
+        if !oldpath_ptr.is_null() && !newpath_ptr.is_null() {
+            if let (Ok(old_s), Ok(new_s)) = (
+                CStr::from_ptr(oldpath_ptr).to_str(),
+                CStr::from_ptr(newpath_ptr).to_str(),
+            ) {
+                let old_full = if old_s.starts_with('/') {
+                    Some(old_s.to_string())
+                } else {
+                    resolve_dirfd(olddirfd, old_s)
+                };
+                let new_full = if new_s.starts_with('/') {
+                    Some(new_s.to_string())
+                } else {
+                    resolve_dirfd(newdirfd, new_s)
+                };
+                if let (Some(ref o), Some(ref n)) = (old_full, new_full) {
+                    if let Some(result) = try_rename_reevofs(o, n) {
+                        return result as libc::c_long;
+                    }
+                }
             }
         }
     }
