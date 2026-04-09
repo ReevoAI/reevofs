@@ -556,7 +556,79 @@ assert_eq "cross-ns rename source preserved" "hello world" "$OUT"
 
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
-echo "=== 14. Benchmarks ==="
+echo "=== 14. Skills-only mode (no REEVOFS_SCOPE_output) ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# Run a sub-environment with only REEVOFS_SCOPE_skills set (no output)
+run_skills_only() {
+    REEVOFS_SCOPE_output="" LD_PRELOAD="$LIB" \
+    REEVO_API_URL="$REEVO_API_URL" REEVO_API_TOKEN="$REEVO_API_TOKEN" \
+    REEVO_USER_ID="$REEVO_USER_ID" REEVO_ORG_ID="$REEVO_ORG_ID" \
+    REEVOFS_SCOPE_skills="$REEVOFS_SCOPE_skills" \
+    env -u REEVOFS_SCOPE_output "$@"
+}
+
+# Skills should still work without output namespace
+OUT=$(run_skills_only cat /reevofs/skills/hello.txt 2>/dev/null)
+assert_eq "skills-only: cat skills file" "hello world" "$OUT"
+
+OUT=$(run_skills_only ls /reevofs/skills/ 2>/dev/null)
+if echo "$OUT" | grep -q "hello.txt"; then
+    PASS=$((PASS + 1))
+    echo "  PASS: skills-only: ls skills"
+else
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: skills-only: ls skills (got: $OUT)"
+    echo "  FAIL: skills-only: ls skills"
+fi
+
+# Output namespace should not be accessible
+assert_fail "skills-only: cat output fails" env -u REEVOFS_SCOPE_output LD_PRELOAD="$LIB" cat /reevofs/output/existing.txt
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== 15. Error propagation on close ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# Use a scope that the mock API rejects (scope starting with "reject-")
+run_reject() {
+    LD_PRELOAD="$LIB" \
+    REEVO_API_URL="$REEVO_API_URL" REEVO_API_TOKEN="$REEVO_API_TOKEN" \
+    REEVO_USER_ID="$REEVO_USER_ID" REEVO_ORG_ID="$REEVO_ORG_ID" \
+    REEVOFS_SCOPE_skills="$REEVOFS_SCOPE_skills" \
+    REEVOFS_SCOPE_output="reject-bad-scope" \
+    "$@"
+}
+
+# Python close() should propagate the API error (EIO)
+if run_reject python3 -c "
+with open('/reevofs/output/test.txt', 'w') as f:
+    f.write('hello')
+" 2>/dev/null; then
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: python write with rejected scope should fail (got success)"
+    echo "  FAIL: python write with rejected scope should fail"
+else
+    PASS=$((PASS + 1))
+    echo "  PASS: python write with rejected scope fails with error"
+fi
+
+# Bash echo redirect — flush happens in dup2, which bash ignores.
+# But we test that the write doesn't silently persist (file shouldn't be readable).
+run_reject bash -c 'echo "hello" > /reevofs/output/test2.txt' 2>/dev/null || true
+# The write should have been rejected by the API, so reading should fail or return stale data.
+if run_reject cat /reevofs/output/test2.txt 2>/dev/null | grep -q "hello"; then
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: rejected write should not persist"
+    echo "  FAIL: rejected write should not persist"
+else
+    PASS=$((PASS + 1))
+    echo "  PASS: rejected write did not persist"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== 16. Benchmarks ==="
 # ═══════════════════════════════════════════════════════════════════════
 
 bench() {

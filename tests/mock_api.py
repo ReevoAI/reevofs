@@ -86,6 +86,11 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else {}
         content = body.get("content", "")
 
+        # Reject writes to scopes starting with "reject-" to simulate backend errors.
+        if scope.startswith("reject-"):
+            self._json_response(400, {"error": "invalid scope"})
+            return
+
         key = fs_key(ns, scope, path)
         FS[key] = content
         self._json_response(200, {"success": True, "path": path})

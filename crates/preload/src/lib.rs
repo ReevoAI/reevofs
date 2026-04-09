@@ -112,20 +112,28 @@ struct Config {
 }
 
 /// Hardcoded mount table. Only scope values come from env vars.
-/// Returns None if any required scope env var is missing — disables the shim entirely.
+/// Each namespace is optional — missing env var skips that namespace.
+/// Returns None if no namespaces are configured — disables the shim entirely.
 fn build_namespaces() -> Option<HashMap<String, Namespace>> {
     let mut ns = HashMap::new();
 
-    ns.insert("skills".into(), Namespace {
-        scope: std::env::var("REEVOFS_SCOPE_skills").ok()?,
-        access: Access::ReadOnly,
-    });
+    if let Ok(scope) = std::env::var("REEVOFS_SCOPE_skills") {
+        ns.insert("skills".into(), Namespace {
+            scope,
+            access: Access::ReadOnly,
+        });
+    }
 
-    ns.insert("output".into(), Namespace {
-        scope: std::env::var("REEVOFS_SCOPE_output").ok()?,
-        access: Access::ReadWrite,
-    });
+    if let Ok(scope) = std::env::var("REEVOFS_SCOPE_output") {
+        ns.insert("output".into(), Namespace {
+            scope,
+            access: Access::ReadWrite,
+        });
+    }
 
+    if ns.is_empty() {
+        return None;
+    }
     Some(ns)
 }
 
@@ -1410,7 +1418,8 @@ pub unsafe extern "C" fn faccessat(dirfd: c_int, path: *const c_char, mode: c_in
 // The fd must still be open and valid.
 // ---------------------------------------------------------------------------
 
-unsafe fn flush_write_fd(fd: c_int, namespace: &str, scope: &str, path: &str) {
+/// Returns true if flush succeeded (or there was nothing to flush).
+unsafe fn flush_write_fd(fd: c_int, namespace: &str, scope: &str, path: &str) -> bool {
     libc::lseek(fd, 0, libc::SEEK_SET);
     let mut content = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -1424,10 +1433,16 @@ unsafe fn flush_write_fd(fd: c_int, namespace: &str, scope: &str, path: &str) {
     if let Some(_guard) = ReentrancyGuard::try_enter() {
         if let Some(cfg) = CONFIG.as_ref() {
             let text = String::from_utf8_lossy(&content);
-            let _ = cfg.client.write_file(namespace, scope, path, &text);
-            invalidate_path(namespace, scope, path);
+            match cfg.client.write_file(namespace, scope, path, &text) {
+                Ok(_) => {
+                    invalidate_path(namespace, scope, path);
+                    return true;
+                }
+                Err(_) => return false,
+            }
         }
     }
+    true // No config or reentrancy — nothing to flush
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,7 +1485,10 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     // for fd 1 which holds the echo output in the memfd.
     let old_state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&newfd));
     if let Some(FdState::Write { namespace, scope, path }) = old_state {
-        flush_write_fd(newfd, &namespace, &scope, &path);
+        if !flush_write_fd(newfd, &namespace, &scope, &path) {
+            set_errno(libc::EIO);
+            return -1;
+        }
     }
 
     // Call real dup2.
@@ -1500,7 +1518,10 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
     // Same logic as dup2 — flush tracked newfd, then propagate.
     let old_state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&newfd));
     if let Some(FdState::Write { namespace, scope, path }) = old_state {
-        flush_write_fd(newfd, &namespace, &scope, &path);
+        if !flush_write_fd(newfd, &namespace, &scope, &path) {
+            set_errno(libc::EIO);
+            return -1;
+        }
     }
 
     type F = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
@@ -1532,7 +1553,14 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     let state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&fd));
 
     if let Some(FdState::Write { namespace, scope, path }) = state {
-        flush_write_fd(fd, &namespace, &scope, &path);
+        if !flush_write_fd(fd, &namespace, &scope, &path) {
+            // Close the real FD but report error to caller.
+            type CloseF = unsafe extern "C" fn(c_int) -> c_int;
+            let real_close: CloseF = std::mem::transmute(dlsym_next(b"close\0"));
+            real_close(fd);
+            set_errno(libc::EIO);
+            return -1;
+        }
     }
 
     // Always call real close.
