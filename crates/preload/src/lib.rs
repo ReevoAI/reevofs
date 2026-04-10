@@ -34,10 +34,11 @@
 //! ## Hooked functions
 //!
 //! Covers POSIX, glibc legacy, 64-bit variants, and raw syscall():
-//! - File I/O: `open`, `openat`, `open64`, `openat64`, `close`
+//! - File I/O: `open`, `openat`, `open64`, `openat64`, `close`,
+//!   `fopen`, `fopen64`, `freopen`, `freopen64`
 //! - Stat: `stat`, `lstat`, `fstat`, `fstatat`, `statx`, `__xstat`, `__lxstat`,
 //!   `__fxstat`, `__fxstatat`, `stat64`, `lstat64`, `fstatat64`
-//! - Access: `access`, `faccessat`
+//! - Access: `access`, `faccessat`, `euidaccess`
 //! - Dir: `opendir`, `readdir`, `closedir`, `scandir`, `scandir64`
 //! - Write: `write` (memfd passthrough), `dup`, `dup2`, `dup3` (tracking + flush)
 //! - Mutate: `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`,
@@ -72,22 +73,112 @@ struct ReentrancyGuard;
 
 impl ReentrancyGuard {
     fn try_enter() -> Option<Self> {
-        IN_HOOK.with(|flag| {
+        // Use try_with to handle TLS destruction during process teardown.
+        // After TLS is destroyed, try_with returns Err and we return None
+        // (treat as re-entrant / skip hook), which is safe.
+        IN_HOOK.try_with(|flag| {
             if flag.get() {
                 None
             } else {
                 flag.set(true);
                 Some(ReentrancyGuard)
             }
-        })
+        }).ok().flatten()
     }
 }
 
 impl Drop for ReentrancyGuard {
     fn drop(&mut self) {
-        IN_HOOK.with(|flag| flag.set(false));
+        let _ = IN_HOOK.try_with(|flag| flag.set(false));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Constructor / Destructor — survive fork+exec for redirects
+// ---------------------------------------------------------------------------
+
+/// File-based IPC for passing Write-fd mappings across exec.
+/// Written by dup2 hook in the child (after fork, before exec), read by
+/// the constructor in the exec'd process.
+/// Format: "fd:namespace:scope:path\n" per line.
+const WFD_DIR: &str = "/tmp/.reevofs_wfd";
+
+fn wfd_path() -> String {
+    format!("{}/{}", WFD_DIR, unsafe { libc::getpid() })
+}
+
+/// Library constructor — runs when the .so is loaded (including after exec).
+/// Restores Write fd tracking from the file written before exec.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __reevofs_init() {
+    restore_wfd_from_file();
+}
+
+// Ensure __reevofs_init runs as a constructor via .init_array.
+#[used]
+#[unsafe(link_section = ".init_array")]
+static INIT: unsafe extern "C" fn() = __reevofs_init;
+
+/// Restore Write fd mappings from the /tmp/.reevofs_wfd/{pid} file.
+unsafe fn restore_wfd_from_file() {
+    let path = wfd_path();
+    let Ok(contents) = std::fs::read_to_string(&path) else { return };
+    // Remove the file immediately so it's not inherited by further children.
+    let _ = std::fs::remove_file(&path);
+
+    if let Ok(mut map) = FD_MAP.try_lock() {
+        for line in contents.lines() {
+            let parts: Vec<&str> = line.splitn(4, ':').collect();
+            if parts.len() == 4 {
+                if let Ok(fd) = parts[0].parse::<c_int>() {
+                    map.insert(fd, FdState::Write {
+                        namespace: parts[1].to_string(),
+                        scope: parts[2].to_string(),
+                        path: parts[3].to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Write current Write fd mappings to /tmp/.reevofs_wfd/{pid}.
+/// Called from dup2 when propagating Write tracking, so exec'd processes
+/// can restore tracking and flush on exit.
+fn sync_wfd_to_file() {
+    // Collect data inside the lock, then do I/O outside to avoid
+    // deadlock with our close hook (which also tries FD_MAP.try_lock).
+    let lines: Vec<String> = {
+        let Ok(map) = FD_MAP.try_lock() else { return };
+        map.iter()
+            .filter_map(|(fd, state)| match state {
+                FdState::Write { namespace, scope, path } =>
+                    Some(format!("{fd}:{namespace}:{scope}:{path}")),
+                _ => None,
+            })
+            .collect()
+    };
+    let path = wfd_path();
+    if lines.is_empty() {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        let _ = std::fs::create_dir_all(WFD_DIR);
+        let _ = std::fs::write(&path, lines.join("\n"));
+    }
+}
+
+/// Library destructor — clean up WFD temp files.
+/// The fclose hook handles flushing Write fds; this just removes any
+/// leftover temp files from sync_wfd_to_file().
+unsafe extern "C" fn __reevofs_fini() {
+    // Clean up any remaining WFD temp file.
+    let path = wfd_path();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[used]
+#[unsafe(link_section = ".fini_array")]
+static FINI: unsafe extern "C" fn() = __reevofs_fini;
 
 // ---------------------------------------------------------------------------
 // Config — hardcoded mount table
@@ -674,6 +765,21 @@ fn try_open_reevofs(path_str: &str, flags: c_int) -> Option<c_int> {
 // Core stat logic
 // ---------------------------------------------------------------------------
 
+/// Fill common stat fields that tools like `ls -l` need to display properly.
+unsafe fn fill_stat_common(buf: *mut libc::stat) {
+    (*buf).st_uid = libc::getuid();
+    (*buf).st_gid = libc::getgid();
+    (*buf).st_blksize = 4096;
+    (*buf).st_blocks = 0;
+    // Use a stable fake device/inode so tools don't get confused.
+    (*buf).st_dev = 0x52_45_45_56; // "REEV"
+    (*buf).st_ino = 1;
+    let now = libc::time(std::ptr::null_mut());
+    (*buf).st_atime = now;
+    (*buf).st_mtime = now;
+    (*buf).st_ctime = now;
+}
+
 fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
     // ── Root mount point ──
     if is_root_path(path_str) {
@@ -683,6 +789,7 @@ fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
             std::ptr::write_bytes(buf, 0, 1);
             (*buf).st_mode = libc::S_IFDIR | 0o555;
             (*buf).st_nlink = 2;
+            fill_stat_common(buf);
         }
         return Some(0);
     }
@@ -712,6 +819,7 @@ fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
                 (*buf).st_mode = file_mode;
                 (*buf).st_size = size as libc::off_t;
                 (*buf).st_nlink = 1;
+                fill_stat_common(buf);
             }
             Some(0)
         }
@@ -719,6 +827,7 @@ fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
             unsafe {
                 (*buf).st_mode = dir_mode;
                 (*buf).st_nlink = 2;
+                fill_stat_common(buf);
             }
             Some(0)
         }
@@ -733,6 +842,25 @@ fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
 // Core statx logic (Linux only — glibc 2.33+ routes stat() through statx)
 // ---------------------------------------------------------------------------
 
+/// Fill common statx fields for proper display by tools like `ls -l`.
+#[cfg(target_os = "linux")]
+unsafe fn fill_statx_common(buf: *mut libc::statx) {
+    (*buf).stx_uid = libc::getuid();
+    (*buf).stx_gid = libc::getgid();
+    (*buf).stx_blksize = 4096;
+    (*buf).stx_dev_major = 0x52; // "R"
+    (*buf).stx_dev_minor = 0x45; // "E"
+    (*buf).stx_ino = 1;
+    let now = libc::time(std::ptr::null_mut());
+    let mut ts: libc::statx_timestamp = std::mem::zeroed();
+    ts.tv_sec = now;
+    ts.tv_nsec = 0;
+    (*buf).stx_atime = ts;
+    (*buf).stx_mtime = ts;
+    (*buf).stx_ctime = ts;
+    (*buf).stx_btime = ts;
+}
+
 #[cfg(target_os = "linux")]
 fn try_statx_reevofs(path_str: &str, mask: libc::c_uint, buf: *mut libc::statx) -> Option<c_int> {
     // ── Root mount point ──
@@ -744,7 +872,7 @@ fn try_statx_reevofs(path_str: &str, mask: libc::c_uint, buf: *mut libc::statx) 
             (*buf).stx_mask = libc::STATX_BASIC_STATS;
             (*buf).stx_mode = (libc::S_IFDIR | 0o555) as u16;
             (*buf).stx_nlink = 2;
-            (*buf).stx_blksize = 4096;
+            fill_statx_common(buf);
         }
         return Some(0);
     }
@@ -775,7 +903,7 @@ fn try_statx_reevofs(path_str: &str, mask: libc::c_uint, buf: *mut libc::statx) 
                 (*buf).stx_mode = file_mode;
                 (*buf).stx_size = size as u64;
                 (*buf).stx_nlink = 1;
-                (*buf).stx_blksize = 4096;
+                fill_statx_common(buf);
             }
             Some(0)
         }
@@ -784,7 +912,7 @@ fn try_statx_reevofs(path_str: &str, mask: libc::c_uint, buf: *mut libc::statx) 
                 (*buf).stx_mask = libc::STATX_BASIC_STATS;
                 (*buf).stx_mode = dir_mode;
                 (*buf).stx_nlink = 2;
-                (*buf).stx_blksize = 4096;
+                fill_statx_common(buf);
             }
             Some(0)
         }
@@ -912,6 +1040,125 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: libc::mod
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::mode_t) -> c_int {
     do_open(path, flags, mode, b"open64\0")
+}
+
+// ---------------------------------------------------------------------------
+// fopen / fopen64 — many coreutils (md5sum, sed, sort, file) use fopen() which
+// internally calls __openat_nocancel (inline syscall), bypassing our openat hook.
+// Intercept fopen to route /reevofs/ paths through our shim.
+// ---------------------------------------------------------------------------
+
+/// Convert fopen mode string to open flags.
+fn fopen_mode_to_flags(mode: &str) -> c_int {
+    match mode.trim_end_matches('b').trim_end_matches(',').trim_end_matches('e') {
+        "r" => libc::O_RDONLY,
+        "w" => libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        "a" => libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+        "r+" => libc::O_RDWR,
+        "w+" => libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+        "a+" => libc::O_RDWR | libc::O_CREAT | libc::O_APPEND,
+        _ => -1,
+    }
+}
+
+unsafe fn do_fopen(path: *const c_char, mode: *const c_char, sym: &[u8]) -> *mut libc::FILE {
+    if !path.is_null() && !mode.is_null() {
+        if let (Ok(path_str), Ok(mode_str)) = (
+            CStr::from_ptr(path).to_str(),
+            CStr::from_ptr(mode).to_str(),
+        ) {
+            let flags = fopen_mode_to_flags(mode_str);
+            if flags >= 0 {
+                if let Some(fd) = try_open_reevofs(path_str, flags) {
+                    if fd < 0 {
+                        return std::ptr::null_mut();
+                    }
+                    // Wrap the fd in a FILE* using fdopen.
+                    type FdOpenF = unsafe extern "C" fn(c_int, *const c_char) -> *mut libc::FILE;
+                    let real_fdopen: FdOpenF = std::mem::transmute(dlsym_next(b"fdopen\0"));
+                    let file = real_fdopen(fd, mode);
+                    if file.is_null() {
+                        // fdopen failed — close the fd.
+                        type CloseF = unsafe extern "C" fn(c_int) -> c_int;
+                        let real_close: CloseF = std::mem::transmute(dlsym_next(b"close\0"));
+                        real_close(fd);
+                    }
+                    return file;
+                }
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(*const c_char, *const c_char) -> *mut libc::FILE;
+    let real: F = std::mem::transmute(dlsym_next(sym));
+    real(path, mode)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut libc::FILE {
+    do_fopen(path, mode, b"fopen\0")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fopen64(path: *const c_char, mode: *const c_char) -> *mut libc::FILE {
+    do_fopen(path, mode, b"fopen64\0")
+}
+
+// ---------------------------------------------------------------------------
+// freopen / freopen64 — GNU coreutils `uniq` uses freopen() to redirect stdin
+// to the input file. Override to route /reevofs/ paths through our shim.
+// ---------------------------------------------------------------------------
+
+unsafe fn do_freopen(path: *const c_char, mode: *const c_char, stream: *mut libc::FILE, sym: &[u8]) -> *mut libc::FILE {
+    if !path.is_null() && !mode.is_null() && !stream.is_null() {
+        if let (Ok(path_str), Ok(mode_str)) = (
+            CStr::from_ptr(path).to_str(),
+            CStr::from_ptr(mode).to_str(),
+        ) {
+            let flags = fopen_mode_to_flags(mode_str);
+            if flags >= 0 {
+                if let Some(fd) = try_open_reevofs(path_str, flags) {
+                    if fd < 0 {
+                        return std::ptr::null_mut();
+                    }
+                    // dup2 the new fd onto the stream's underlying fd so the FILE*
+                    // (e.g. stdin) remains valid and the caller can keep reading it.
+                    let old_fd = libc::fileno(stream);
+                    if old_fd >= 0 {
+                        libc::dup2(fd, old_fd);
+                        libc::close(fd);
+                        // Reset the FILE* internal state so it re-reads from the new fd.
+                        libc::fflush(stream);
+                        libc::rewind(stream);
+                        return stream;
+                    }
+                    // Fallback: close stream, fdopen the new fd.
+                    type FcloseF = unsafe extern "C" fn(*mut libc::FILE) -> c_int;
+                    let real_fclose: FcloseF = std::mem::transmute(dlsym_next(b"fclose\0"));
+                    real_fclose(stream);
+                    type FdOpenF = unsafe extern "C" fn(c_int, *const c_char) -> *mut libc::FILE;
+                    let real_fdopen: FdOpenF = std::mem::transmute(dlsym_next(b"fdopen\0"));
+                    let file = real_fdopen(fd, mode);
+                    if file.is_null() {
+                        libc::close(fd);
+                    }
+                    return file;
+                }
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(*const c_char, *const c_char, *mut libc::FILE) -> *mut libc::FILE;
+    let real: F = std::mem::transmute(dlsym_next(sym));
+    real(path, mode, stream)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn freopen(path: *const c_char, mode: *const c_char, stream: *mut libc::FILE) -> *mut libc::FILE {
+    do_freopen(path, mode, stream, b"freopen\0")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn freopen64(path: *const c_char, mode: *const c_char, stream: *mut libc::FILE) -> *mut libc::FILE {
+    do_freopen(path, mode, stream, b"freopen64\0")
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,6 +1660,22 @@ pub unsafe extern "C" fn faccessat(dirfd: c_int, path: *const c_char, mode: c_in
     real(dirfd, path, mode, flags)
 }
 
+// euidaccess — GNU coreutils (sort, etc.) call euidaccess() before opening files.
+// euidaccess internally does newfstatat, bypassing our hooks. Override it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn euidaccess(path: *const c_char, mode: c_int) -> c_int {
+    if !path.is_null() {
+        if let Ok(s) = CStr::from_ptr(path).to_str() {
+            if let Some(result) = try_access_reevofs(s, mode) {
+                return result;
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"euidaccess\0"));
+    real(path, mode)
+}
+
 // ---------------------------------------------------------------------------
 // Flush helper — reads memfd content via the fd and sends to API.
 // The fd must still be open and valid.
@@ -1443,6 +1706,29 @@ unsafe fn flush_write_fd(fd: c_int, namespace: &str, scope: &str, path: &str) ->
         }
     }
     true // No config or reentrancy — nothing to flush
+}
+
+/// Same as flush_write_fd but skips invalidate_path.
+/// Used by the fclose hook which runs during process teardown (atexit);
+/// accessing papaya's CACHE during teardown triggers a TLS panic.
+unsafe fn flush_write_fd_no_invalidate(fd: c_int, namespace: &str, scope: &str, path: &str) -> bool {
+    libc::lseek(fd, 0, libc::SEEK_SET);
+    let mut content = Vec::new();
+    let mut tmp = [0u8; 8192];
+    type ReadF = unsafe extern "C" fn(c_int, *mut c_void, libc::size_t) -> libc::ssize_t;
+    let real_read: ReadF = std::mem::transmute(dlsym_next(b"read\0"));
+    loop {
+        let n = real_read(fd, tmp.as_mut_ptr() as *mut c_void, tmp.len());
+        if n <= 0 { break; }
+        content.extend_from_slice(&tmp[..n as usize]);
+    }
+    if let Some(_guard) = ReentrancyGuard::try_enter() {
+        if let Some(cfg) = CONFIG.as_ref() {
+            let text = String::from_utf8_lossy(&content);
+            return cfg.client.write_file(namespace, scope, path, &text).is_ok();
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,6 +1794,8 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
                 map.insert(newfd, cloned);
             }
         }
+        // Sync to env so exec'd processes can restore tracking.
+        sync_wfd_to_file();
     }
     result
 }
@@ -1553,6 +1841,8 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     let state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&fd));
 
     if let Some(FdState::Write { namespace, scope, path }) = state {
+        // Sync env to remove this fd from exec tracking.
+        sync_wfd_to_file();
         if !flush_write_fd(fd, &namespace, &scope, &path) {
             // Close the real FD but report error to caller.
             type CloseF = unsafe extern "C" fn(c_int) -> c_int;
@@ -1567,6 +1857,34 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     type CloseF = unsafe extern "C" fn(c_int) -> c_int;
     let real_close: CloseF = std::mem::transmute(dlsym_next(b"close\0"));
     real_close(fd)
+}
+
+// ---------------------------------------------------------------------------
+// fclose — glibc's fclose uses __close_nocancel (inline syscall) which
+// bypasses our close hook. Hook fclose to flush Write fds before closing.
+// Critical for coreutils that call close_stdout() at exit (sort, uniq, etc.).
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fclose(stream: *mut libc::FILE) -> c_int {
+    if !stream.is_null() {
+        let fd = libc::fileno(stream);
+        if fd >= 0 {
+            let state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&fd));
+            if let Some(FdState::Write { namespace, scope, path }) = state {
+                sync_wfd_to_file();
+                // Flush the stream to ensure all buffered content is in the memfd.
+                libc::fflush(stream);
+                // Flush fd content to API. Skip invalidate_path because this
+                // runs during process exit (via close_stdout atexit handler)
+                // and the papaya CACHE's TLS is unsafe to access during teardown.
+                flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
+            }
+        }
+    }
+    type F = unsafe extern "C" fn(*mut libc::FILE) -> c_int;
+    let real: F = std::mem::transmute(dlsym_next(b"fclose\0"));
+    real(stream)
 }
 
 // ---------------------------------------------------------------------------
@@ -1758,9 +2076,25 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: libc::mode_t) -> c_int
 // ---------------------------------------------------------------------------
 
 fn try_rename_reevofs(old_path: &str, new_path: &str) -> Option<c_int> {
-    // Both paths must be under /reevofs/
-    if !quick_prefix_match(old_path) || !quick_prefix_match(new_path) {
+    let src_reevo = quick_prefix_match(old_path);
+    let dst_reevo = quick_prefix_match(new_path);
+
+    // Neither path is under /reevofs/ — not our business.
+    if !src_reevo && !dst_reevo {
         return None;
+    }
+
+    // Cross-filesystem rename: source outside /reevofs/, dest inside.
+    // Return EXDEV so mv falls back to copy (which works via open/write/close).
+    if !src_reevo && dst_reevo {
+        set_errno(libc::EXDEV);
+        return Some(-1);
+    }
+
+    // Dest outside /reevofs/ but source inside — also cross-device.
+    if src_reevo && !dst_reevo {
+        set_errno(libc::EXDEV);
+        return Some(-1);
     }
     let _guard = ReentrancyGuard::try_enter()?;
     let (cfg, src_ns_cfg, src_ns, src_api_path) = match_path(old_path)?;
