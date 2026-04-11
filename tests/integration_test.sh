@@ -704,6 +704,11 @@ run cp /tmp/cp_regression_src.txt /reevofs/output/cp_regression_dst.txt 2>/dev/n
 OUT=$(run cat /reevofs/output/cp_regression_dst.txt 2>/dev/null)
 assert_eq "cp to new output file (regression)" "cp regression test" "$OUT"
 
+# GNU find — known limitation: find uses fstatat(dirfd, relative_path) internally,
+# and glibc's fstatat on modern kernels uses inline syscalls that bypass our PLT hooks.
+# Use python os.walk (section 18) for recursive traversal instead.
+echo "  SKIP: GNU find (known limitation — use python os.walk instead)"
+
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
 echo "=== 18. Recursive directory access ==="
