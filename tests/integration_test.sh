@@ -688,6 +688,22 @@ run bash -c 'cat /reevofs/skills/hello.txt > /tmp/cp_from_reevofs.txt'
 OUT=$(cat /tmp/cp_from_reevofs.txt 2>/dev/null)
 assert_eq "cp reevofs→real (via cat)" "hello world" "$OUT"
 
+# Regression: stat on non-existent output file should return ENOENT, not IsDir
+if run stat /reevofs/output/nonexistent_file_xyz.txt 2>/dev/null; then
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: stat non-existent file should fail (got success)"
+    echo "  FAIL: stat non-existent file should fail"
+else
+    PASS=$((PASS + 1))
+    echo "  PASS: stat non-existent file returns ENOENT"
+fi
+
+# Regression: cp to a new (non-existent) output path should work
+echo "cp regression test" > /tmp/cp_regression_src.txt
+run cp /tmp/cp_regression_src.txt /reevofs/output/cp_regression_dst.txt 2>/dev/null
+OUT=$(run cat /reevofs/output/cp_regression_dst.txt 2>/dev/null)
+assert_eq "cp to new output file (regression)" "cp regression test" "$OUT"
+
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
 echo "=== 18. Recursive directory access ==="
