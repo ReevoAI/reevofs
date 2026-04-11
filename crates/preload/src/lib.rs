@@ -354,9 +354,14 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
         let entries: Vec<(String, bool)> = resp.entries.iter()
             .map(|e| (e.name.clone(), e.is_directory))
             .collect();
-        let result = entries.clone();
-        CACHE.pin().insert(key, CacheEntry::Dir { entries, at: Instant::now() });
-        return ExistsResult::IsDir { entries: result };
+        // Only classify as directory if it actually has children.
+        // The real API may return 200 with empty entries for non-existent paths,
+        // which would cause stat() to report files as directories (breaking cp/mv).
+        if !entries.is_empty() {
+            let result = entries.clone();
+            CACHE.pin().insert(key, CacheEntry::Dir { entries, at: Instant::now() });
+            return ExistsResult::IsDir { entries: result };
+        }
     }
     CACHE.pin().insert(key, CacheEntry::NotFound { at: Instant::now() });
     ExistsResult::NotFound
