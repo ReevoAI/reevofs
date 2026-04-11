@@ -13,7 +13,7 @@ RUN cargo build --release -p reevofs-preload 2>&1
 FROM python:3.13.11-slim-trixie
 
 RUN apt-get update && apt-get install -y \
-    bash coreutils findutils \
+    bash coreutils findutils nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

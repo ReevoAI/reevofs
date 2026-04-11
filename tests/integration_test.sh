@@ -405,6 +405,10 @@ echo ""
 echo "=== 12. Node.js file access ==="
 # ═══════════════════════════════════════════════════════════════════════
 
+if ! command -v node &>/dev/null; then
+    echo "  SKIP: node not found, skipping Node.js tests"
+else
+
 # Node readFileSync
 OUT=$(run timeout 10 node -e "
 const fs = require('fs');
@@ -480,6 +484,8 @@ try { fs.accessSync('/reevofs/output/existing.txt', fs.constants.W_OK); console.
 catch(e) { console.log('not writable'); }
 " 2>/dev/null)
 assert_eq "node accessSync writable" "writable" "$OUT"
+
+fi  # end node check
 
 # ═══════════════════════════════════════════════════════════════════════
 echo "=== 13. rename / mv ==="
