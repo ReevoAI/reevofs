@@ -395,6 +395,31 @@ assert_eq "bash multiline write" "line1
 line2
 line3" "$OUT"
 
+# Heredoc via cat (fork+exec path — tests that close() doesn't prematurely flush 0 bytes)
+run bash -c 'cat > /reevofs/output/heredoc-test.txt << EOF
+line1 from heredoc
+line2 from heredoc
+line3 from heredoc
+EOF'
+OUT=$(run cat /reevofs/output/heredoc-test.txt)
+assert_eq "heredoc via cat" "line1 from heredoc
+line2 from heredoc
+line3 from heredoc" "$OUT"
+
+# Heredoc via cat with quoted delimiter (no variable expansion)
+run bash -c 'cat > /reevofs/output/heredoc-quoted.txt << '\''ENDOFFILE'\''
+def hello():
+    print("world")
+ENDOFFILE'
+OUT=$(run cat /reevofs/output/heredoc-quoted.txt)
+assert_eq "heredoc via cat (quoted delim)" 'def hello():
+    print("world")' "$OUT"
+
+# Pipe to external command writing to reevofs (fork+exec path)
+run bash -c 'echo "piped content" | cat > /reevofs/output/pipe-cat.txt'
+OUT=$(run cat /reevofs/output/pipe-cat.txt)
+assert_eq "pipe to cat > reevofs" "piped content" "$OUT"
+
 # Bash append (>>)
 run bash -c 'echo "first" > /reevofs/output/append-test.txt'
 run bash -c 'echo "second" >> /reevofs/output/append-test.txt'
@@ -1488,7 +1513,135 @@ banana" "$OUT"
 
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
-echo "=== 29. Benchmarks ==="
+echo "=== 29. Fork+exec, redirects, and advanced write patterns ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# --- Subshell write: (cmd) > /reevofs/file ---
+# Tests fd inheritance through subshell fork
+run bash -c '(echo "from subshell") > /reevofs/output/subshell.txt'
+OUT=$(run cat /reevofs/output/subshell.txt)
+assert_eq "subshell write" "from subshell" "$OUT"
+
+# --- Subshell with multiple commands ---
+run bash -c '(echo "line1"; echo "line2"; echo "line3") > /reevofs/output/subshell_multi.txt'
+OUT=$(run cat /reevofs/output/subshell_multi.txt)
+assert_eq "subshell multi-cmd write" "line1
+line2
+line3" "$OUT"
+
+# --- Here-string via cat ---
+run bash -c 'cat <<< "here-string content" > /reevofs/output/herestring.txt'
+OUT=$(run cat /reevofs/output/herestring.txt)
+assert_eq "here-string via cat" "here-string content" "$OUT"
+
+# --- Tee writing to reevofs ---
+OUT=$(run bash -c 'echo "tee content" | tee /reevofs/output/tee_out.txt')
+assert_eq "tee stdout passthrough" "tee content" "$OUT"
+OUT=$(run cat /reevofs/output/tee_out.txt)
+assert_eq "tee file write" "tee content" "$OUT"
+
+# --- Tee to multiple reevofs files ---
+run bash -c 'echo "multi tee" | tee /reevofs/output/tee_a.txt > /reevofs/output/tee_b.txt'
+OUT_A=$(run cat /reevofs/output/tee_a.txt)
+OUT_B=$(run cat /reevofs/output/tee_b.txt)
+assert_eq "tee to multiple files (a)" "multi tee" "$OUT_A"
+assert_eq "tee to multiple files (b)" "multi tee" "$OUT_B"
+
+# --- Pipeline: external cmd | external cmd > reevofs ---
+run bash -c 'echo -e "ccc\naaa\nbbb" | sort > /reevofs/output/pipe_sort.txt'
+OUT=$(run cat /reevofs/output/pipe_sort.txt)
+assert_eq "pipeline sort > reevofs" "aaa
+bbb
+ccc" "$OUT"
+
+# --- Pipeline: 3-stage with reevofs output ---
+run bash -c 'echo -e "Hello World\nFoo Bar" | tr "[:upper:]" "[:lower:]" | sort > /reevofs/output/pipe3.txt'
+OUT=$(run cat /reevofs/output/pipe3.txt)
+assert_eq "3-stage pipeline > reevofs" "foo bar
+hello world" "$OUT"
+
+# --- Background process write ---
+run bash -c 'echo "bg content" > /reevofs/output/bg_write.txt & wait'
+OUT=$(run cat /reevofs/output/bg_write.txt)
+assert_eq "background write" "bg content" "$OUT"
+
+# --- Large file crossing 8192-byte buffer boundary ---
+# flush_write_fd reads in 8192-byte chunks; test boundary at exactly 8192 and 8193 bytes
+run bash -c 'python3 -c "print(\"A\" * 8192, end=\"\")" > /reevofs/output/boundary_8192.txt'
+OUT=$(run bash -c 'wc -c < /reevofs/output/boundary_8192.txt' | tr -d ' ')
+assert_eq "write exactly 8192 bytes" "8192" "$OUT"
+
+run bash -c 'python3 -c "print(\"B\" * 8193, end=\"\")" > /reevofs/output/boundary_8193.txt'
+OUT=$(run bash -c 'wc -c < /reevofs/output/boundary_8193.txt' | tr -d ' ')
+assert_eq "write 8193 bytes (crosses buffer)" "8193" "$OUT"
+
+# --- Heredoc with large content (multi-chunk write through cat fork+exec) ---
+run bash -c 'cat > /reevofs/output/heredoc_large.txt << EOF
+$(python3 -c "print(\"X\" * 20000)")
+EOF'
+OUT=$(run bash -c 'wc -c < /reevofs/output/heredoc_large.txt' | tr -d ' ')
+# 20000 chars + newline from print (heredoc strips trailing newline for the delimiter line)
+assert_eq "large heredoc via cat (20KB)" "20001" "$OUT"
+
+# --- Concurrent writes from parallel background processes ---
+run bash -c '
+echo "proc1" > /reevofs/output/concurrent_1.txt &
+echo "proc2" > /reevofs/output/concurrent_2.txt &
+echo "proc3" > /reevofs/output/concurrent_3.txt &
+wait
+'
+OUT1=$(run cat /reevofs/output/concurrent_1.txt)
+OUT2=$(run cat /reevofs/output/concurrent_2.txt)
+OUT3=$(run cat /reevofs/output/concurrent_3.txt)
+assert_eq "concurrent write 1" "proc1" "$OUT1"
+assert_eq "concurrent write 2" "proc2" "$OUT2"
+assert_eq "concurrent write 3" "proc3" "$OUT3"
+
+# --- xargs writing to reevofs ---
+run bash -c 'echo -e "x1\nx2\nx3" | xargs -I{} bash -c "echo \"val_{}\" > /reevofs/output/xargs_{}.txt"'
+OUT=$(run cat /reevofs/output/xargs_x1.txt)
+assert_eq "xargs write" "val_x1" "$OUT"
+
+# --- dd writing to reevofs ---
+run bash -c 'echo "dd content" | dd of=/reevofs/output/dd_out.txt 2>/dev/null'
+OUT=$(run cat /reevofs/output/dd_out.txt)
+assert_eq "dd write to reevofs" "dd content" "$OUT"
+
+# --- exec fd redirect (open fd 3, write via >&3, close) ---
+run bash -c 'exec 3>/reevofs/output/exec_fd.txt; echo "via fd 3" >&3; exec 3>&-'
+OUT=$(run cat /reevofs/output/exec_fd.txt)
+assert_eq "exec fd redirect (fd 3)" "via fd 3" "$OUT"
+
+# --- Process substitution writing to reevofs ---
+# Using tee with process substitution to write to reevofs
+run bash -c 'echo "procsub" | tee >(cat > /reevofs/output/procsub.txt) > /dev/null; sleep 0.2'
+OUT=$(run cat /reevofs/output/procsub.txt)
+assert_eq "process substitution write" "procsub" "$OUT"
+
+# --- Node.js write via syscall(SYS_close) path ---
+run node -e "
+const fs = require('fs');
+fs.writeFileSync('/reevofs/output/node_sync.txt', 'node sync write');
+const content = fs.readFileSync('/reevofs/output/node_sync.txt', 'utf8');
+if (content !== 'node sync write') process.exit(1);
+"
+assert_ok "node.js writeFileSync + readFileSync" true
+
+# Node.js async write
+run node -e "
+const fs = require('fs').promises;
+async function main() {
+    await fs.writeFile('/reevofs/output/node_async.txt', 'node async write');
+    const content = await fs.readFile('/reevofs/output/node_async.txt', 'utf8');
+    if (content !== 'node async write') process.exit(1);
+}
+main();
+"
+assert_ok "node.js async write + read" true
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== 30. Benchmarks ==="
 # ═══════════════════════════════════════════════════════════════════════
 
 bench() {
