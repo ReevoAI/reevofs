@@ -22,7 +22,10 @@ SEED = {
     "skills/overlay/my-skill/config.json": '{"name": "my-skill", "version": "1.0"}',
     "skills/overlay/another-skill/README.md": "# Another Skill",
     "skills/overlay/hello.txt": "hello world",
-    "output/test-chat-id/existing.txt": "existing output content",
+    # NOTE: output namespace is intentionally NOT pre-seeded.
+    # The real API returns 404 for empty namespaces, and our shim must
+    # handle this by treating configured namespace roots as always-existing
+    # directories. Pre-seeding output data here would mask this bug.
 }
 
 

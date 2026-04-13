@@ -363,6 +363,14 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
             return ExistsResult::IsDir { entries: result };
         }
     }
+    // Namespace roots (api_path == "/") are always valid directories,
+    // even when the API returns 404 (no files yet). Without this,
+    // `stat /reevofs/output/` fails and tools like cp/mv can't resolve
+    // the destination directory.
+    if path == "/" {
+        CACHE.pin().insert(key, CacheEntry::Dir { entries: vec![], at: Instant::now() });
+        return ExistsResult::IsDir { entries: vec![] };
+    }
     CACHE.pin().insert(key, CacheEntry::NotFound { at: Instant::now() });
     ExistsResult::NotFound
 }
@@ -675,8 +683,12 @@ fn try_open_reevofs(path_str: &str, flags: c_int) -> Option<c_int> {
 
     // ── Directory open (for ls / readdir) ──
     if is_dir_open {
+        // Namespace roots (api_path == "/") always exist as directories,
+        // even if the API returns 404 (empty namespace). This matches how
+        // the real API works — configured namespaces are always valid dirs.
         let list = match cached_list_dir(cfg, namespace, &ns_cfg.scope, api_path) {
             Ok(entries) => entries,
+            Err(_) if api_path == "/" => vec![], // namespace root: empty dir
             Err(_) => {
                 set_errno(libc::ENOENT);
                 return Some(-1);
