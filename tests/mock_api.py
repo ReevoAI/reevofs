@@ -148,10 +148,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 entries[child] = is_dir
 
-        if not entries and list_path:
-            # Non-root directory with no children doesn't exist.
-            self._json_response(404, {"error": "not found"})
-            return
+        # NOTE: The real API returns 200 with empty entries for non-existent
+        # paths (not 404). We match that behavior here so our tests catch bugs
+        # where the shim incorrectly treats empty list_dir results as valid
+        # directories (e.g. the cp/mv nested path bug with O_DIRECTORY probe).
 
         result = [{"name": name, "is_directory": is_dir} for name, is_dir in sorted(entries.items())]
         self._json_response(200, {"path": f"/{list_path}" if list_path else "/", "entries": result})
