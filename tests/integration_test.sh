@@ -66,6 +66,35 @@ assert_fail() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+echo "=== 0. Empty namespace root (before any writes) ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# Output namespace has NO pre-seeded files — matches real API behavior.
+# These tests catch the bug where ls/stat/cp fail on empty namespaces.
+
+assert_ok "stat empty output namespace root" stat /reevofs/output
+assert_ok "stat empty output namespace root/" stat /reevofs/output/
+assert_ok "ls empty output namespace (no files)" timeout 5 ls /reevofs/output/
+assert_ok "ls -l empty output namespace" timeout 5 ls -l /reevofs/output/
+
+# cp to empty output namespace — the real-world failure scenario
+echo "cp to empty ns" > /tmp/cp_empty_ns_src.txt
+run cp /tmp/cp_empty_ns_src.txt /reevofs/output/cp_empty_ns.txt 2>/dev/null
+OUT=$(run cat /reevofs/output/cp_empty_ns.txt 2>/dev/null)
+assert_eq "cp to empty output namespace" "cp to empty ns" "$OUT"
+
+# mv to empty output namespace
+echo "mv to empty ns" > /tmp/mv_empty_ns_src.txt
+run mv /tmp/mv_empty_ns_src.txt /reevofs/output/mv_empty_ns.txt 2>/dev/null
+OUT=$(run cat /reevofs/output/mv_empty_ns.txt 2>/dev/null)
+assert_eq "mv to empty output namespace" "mv to empty ns" "$OUT"
+
+# Clean up so later tests see a fresh state
+run rm /reevofs/output/cp_empty_ns.txt 2>/dev/null || true
+run rm /reevofs/output/mv_empty_ns.txt 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
 echo "=== 1. cat (read file) ==="
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -76,8 +105,10 @@ This is a test skill." "$OUT"
 OUT=$(run cat /reevofs/skills/hello.txt)
 assert_eq "cat simple file" "hello world" "$OUT"
 
-OUT=$(run cat /reevofs/output/existing.txt)
-assert_eq "cat output file" "existing output content" "$OUT"
+# Write a file to output so we can read it back (output namespace starts empty)
+run bash -c 'echo "seeded output content" > /reevofs/output/seeded.txt'
+OUT=$(run cat /reevofs/output/seeded.txt)
+assert_eq "cat output file" "seeded output content" "$OUT"
 
 # Non-existent file should fail
 assert_fail "cat nonexistent file" cat /reevofs/skills/nope.txt
@@ -177,9 +208,9 @@ run bash -c 'echo "test data" > /reevofs/output/new-file.txt'
 OUT=$(run cat /reevofs/output/new-file.txt)
 assert_eq "write then read new file" "test data" "$OUT"
 
-# Overwrite existing file
-run bash -c 'echo "updated" > /reevofs/output/existing.txt'
-OUT=$(run cat /reevofs/output/existing.txt)
+# Overwrite existing file (seeded.txt was created in section 1)
+run bash -c 'echo "updated" > /reevofs/output/seeded.txt'
+OUT=$(run cat /reevofs/output/seeded.txt)
 assert_eq "overwrite existing file" "updated" "$OUT"
 
 # Write should fail on read-only namespace
@@ -295,7 +326,7 @@ assert_eq "write access denied on skills" "False" "$OUT"
 
 OUT=$(run python3 -c "
 import os
-print(os.access('/reevofs/output/existing.txt', os.W_OK))
+print(os.access('/reevofs/output/seeded.txt', os.W_OK))
 " 2>/dev/null)
 assert_eq "write access on output" "True" "$OUT"
 
@@ -349,7 +380,7 @@ run bash -c 'test -w /reevofs/skills/hello.txt && echo yes || echo no' > /tmp/ba
 OUT=$(cat /tmp/bash_test_w.out)
 assert_eq "bash test -w (read-only)" "no" "$OUT"
 
-run bash -c 'test -w /reevofs/output/existing.txt && echo yes || echo no' > /tmp/bash_test_w2.out 2>/dev/null
+run bash -c 'test -w /reevofs/output/seeded.txt && echo yes || echo no' > /tmp/bash_test_w2.out 2>/dev/null
 OUT=$(cat /tmp/bash_test_w2.out)
 assert_eq "bash test -w (writable)" "yes" "$OUT"
 
@@ -480,7 +511,7 @@ not writable" "$OUT"
 
 OUT=$(run timeout 10 node -e "
 const fs = require('fs');
-try { fs.accessSync('/reevofs/output/existing.txt', fs.constants.W_OK); console.log('writable'); }
+try { fs.accessSync('/reevofs/output/seeded.txt', fs.constants.W_OK); console.log('writable'); }
 catch(e) { console.log('not writable'); }
 " 2>/dev/null)
 assert_eq "node accessSync writable" "writable" "$OUT"
@@ -589,7 +620,7 @@ else
 fi
 
 # Output namespace should not be accessible
-assert_fail "skills-only: cat output fails" env -u REEVOFS_SCOPE_output LD_PRELOAD="$LIB" cat /reevofs/output/existing.txt
+assert_fail "skills-only: cat output fails" env -u REEVOFS_SCOPE_output LD_PRELOAD="$LIB" cat /reevofs/output/seeded.txt
 
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
