@@ -228,6 +228,17 @@ fn build_namespaces() -> Option<HashMap<String, Namespace>> {
     Some(ns)
 }
 
+/// Debug logging — enable with REEVOFS_DEBUG=1
+static DEBUG: Lazy<bool> = Lazy::new(|| std::env::var("REEVOFS_DEBUG").is_ok());
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if *DEBUG {
+            eprintln!("[reevofs] {}", format!($($arg)*));
+        }
+    };
+}
+
 static CONFIG: Lazy<Option<Config>> = Lazy::new(|| {
     let _guard = ReentrancyGuard::try_enter();
 
@@ -332,11 +343,17 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
     let guard = CACHE.pin();
     if let Some(entry) = guard.get(&key) {
         if entry.is_valid() {
-            return match entry {
+            let result = match entry {
                 CacheEntry::File { content, .. } => ExistsResult::IsFile { size: content.len() },
                 CacheEntry::Dir { entries, .. } => ExistsResult::IsDir { entries: entries.clone() },
                 CacheEntry::NotFound { .. } => ExistsResult::NotFound,
             };
+            debug_log!("cached_exists ns={} path={} -> {} (cached)", ns, path, match &result {
+                ExistsResult::IsFile { size } => format!("IsFile({})", size),
+                ExistsResult::IsDir { entries } => format!("IsDir({})", entries.len()),
+                ExistsResult::NotFound => "NotFound".into(),
+            });
+            return result;
         }
     }
     drop(guard);
@@ -344,6 +361,7 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
     // Cache miss — query API.
     if let Ok(resp) = cfg.client.read_file(ns, scope, path) {
         let size = resp.content.len();
+        debug_log!("cached_exists ns={} path={} -> IsFile({}) (read_file hit)", ns, path, size);
         CACHE.pin().insert(key, CacheEntry::File {
             content: resp.content,
             at: Instant::now(),
@@ -354,6 +372,7 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
         let entries: Vec<(String, bool)> = resp.entries.iter()
             .map(|e| (e.name.clone(), e.is_directory))
             .collect();
+        debug_log!("cached_exists ns={} path={} -> list_dir returned {} entries", ns, path, entries.len());
         // Only classify as directory if it actually has children.
         // The real API may return 200 with empty entries for non-existent paths,
         // which would cause stat() to report files as directories (breaking cp/mv).
@@ -368,9 +387,11 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
     // `stat /reevofs/output/` fails and tools like cp/mv can't resolve
     // the destination directory.
     if path == "/" {
+        debug_log!("cached_exists ns={} path={} -> IsDir(0) (namespace root)", ns, path);
         CACHE.pin().insert(key, CacheEntry::Dir { entries: vec![], at: Instant::now() });
         return ExistsResult::IsDir { entries: vec![] };
     }
+    debug_log!("cached_exists ns={} path={} -> NotFound", ns, path);
     CACHE.pin().insert(key, CacheEntry::NotFound { at: Instant::now() });
     ExistsResult::NotFound
 }
@@ -426,6 +447,16 @@ fn cached_list_dir(cfg: &Config, ns: &str, scope: &str, path: &str) -> Result<Ve
             let entries: Vec<(String, bool)> = resp.entries.iter()
                 .map(|e| (e.name.clone(), e.is_directory))
                 .collect();
+            // Empty entries on a non-root path means the path doesn't exist as
+            // a directory.  Some backends return 200 with [] for any path; treating
+            // that as a valid dir tricks `cp`/`mv` (which probe with O_DIRECTORY)
+            // into appending the source basename → nested path bug.
+            if entries.is_empty() && path != "/" {
+                debug_log!("cached_list_dir ns={} path={} -> empty entries, treating as NotFound", ns, path);
+                CACHE.pin().insert(key, CacheEntry::NotFound { at: Instant::now() });
+                return Err(());
+            }
+            debug_log!("cached_list_dir ns={} path={} -> {} entries", ns, path, entries.len());
             let result = entries.clone();
             CACHE.pin().insert(key, CacheEntry::Dir { entries, at: Instant::now() });
             Ok(result)
