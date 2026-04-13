@@ -41,6 +41,7 @@
 //! - Access: `access`, `faccessat`, `euidaccess`
 //! - Dir: `opendir`, `readdir`, `closedir`, `scandir`, `scandir64`
 //! - Write: `write` (memfd passthrough), `dup`, `dup2`, `dup3` (tracking + flush)
+//! - Exit: `_exit`, `_Exit` (flush remaining Write fds before process termination)
 //! - Mutate: `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`,
 //!   `rename`, `renameat`, `renameat2`
 //! - Raw: `syscall()` hook for SYS_close, SYS_statx, SYS_openat, SYS_getdents64,
@@ -55,7 +56,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -107,11 +108,22 @@ fn wfd_path() -> String {
     format!("{}/{}", WFD_DIR, unsafe { libc::getpid() })
 }
 
+/// atexit handler — flush any remaining Write fds before the process exits.
+/// This is the primary flush mechanism for bash subshells which call exit()
+/// but never fclose(stdout) or call _exit() through PLT.
+extern "C" fn atexit_flush() {
+    unsafe { flush_all_write_fds(); }
+}
+
 /// Library constructor — runs when the .so is loaded (including after exec).
 /// Restores Write fd tracking from the file written before exec.
+/// Registers an atexit handler to flush Write fds on normal process exit.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __reevofs_init() {
     restore_wfd_from_file();
+    // Register atexit handler. Runs during exit() in reverse registration order,
+    // so this (registered early) runs late — after application cleanup but before _exit.
+    libc::atexit(atexit_flush);
 }
 
 // Ensure __reevofs_init runs as a constructor via .init_array.
@@ -135,6 +147,7 @@ unsafe fn restore_wfd_from_file() {
                         namespace: parts[1].to_string(),
                         scope: parts[2].to_string(),
                         path: parts[3].to_string(),
+                        peers: Arc::new(()),
                     });
                 }
             }
@@ -152,7 +165,7 @@ fn sync_wfd_to_file() {
         let Ok(map) = FD_MAP.try_lock() else { return };
         map.iter()
             .filter_map(|(fd, state)| match state {
-                FdState::Write { namespace, scope, path } =>
+                FdState::Write { namespace, scope, path, .. } =>
                     Some(format!("{fd}:{namespace}:{scope}:{path}")),
                 _ => None,
             })
@@ -492,6 +505,9 @@ enum FdState {
         namespace: String,
         scope: String,
         path: String,
+        /// Shared handle among dup'd fds pointing to the same memfd.
+        /// Only flush to API when this is the last reference (strong_count == 1).
+        peers: Arc<()>,
     },
 }
 
@@ -788,6 +804,7 @@ fn try_open_reevofs(path_str: &str, flags: c_int) -> Option<c_int> {
                 namespace: namespace.into(),
                 scope: ns_cfg.scope.clone(),
                 path: api_path.into(),
+                peers: Arc::new(()),
             });
         }
         return Some(fd);
@@ -1792,11 +1809,12 @@ pub unsafe extern "C" fn dup(oldfd: c_int) -> c_int {
     let newfd = real_dup(oldfd);
     if newfd >= 0 {
         if let Ok(mut map) = FD_MAP.try_lock() {
-            if let Some(FdState::Write { namespace, scope, path }) = map.get(&oldfd) {
+            if let Some(FdState::Write { namespace, scope, path, peers }) = map.get(&oldfd) {
                 let cloned = FdState::Write {
                     namespace: namespace.clone(),
                     scope: scope.clone(),
                     path: path.clone(),
+                    peers: peers.clone(),
                 };
                 map.insert(newfd, cloned);
             }
@@ -1818,10 +1836,15 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     // This is the critical path: bash's dup2(saved_stdout, 1) triggers this
     // for fd 1 which holds the echo output in the memfd.
     let old_state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&newfd));
-    if let Some(FdState::Write { namespace, scope, path }) = old_state {
-        if !flush_write_fd(newfd, &namespace, &scope, &path) {
-            set_errno(libc::EIO);
-            return -1;
+    if let Some(FdState::Write { namespace, scope, path, peers }) = old_state {
+        // Only flush if this is the last fd pointing to this memfd.
+        // Prevents premature 0-byte uploads when bash does open→dup2→close
+        // before the child process (e.g. cat) has written anything.
+        if Arc::strong_count(&peers) == 1 {
+            if !flush_write_fd(newfd, &namespace, &scope, &path) {
+                set_errno(libc::EIO);
+                return -1;
+            }
         }
     }
 
@@ -1833,11 +1856,12 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
     // Propagate Write tracking from oldfd to newfd.
     if result >= 0 {
         if let Ok(mut map) = FD_MAP.try_lock() {
-            if let Some(FdState::Write { namespace, scope, path }) = map.get(&oldfd) {
+            if let Some(FdState::Write { namespace, scope, path, peers }) = map.get(&oldfd) {
                 let cloned = FdState::Write {
                     namespace: namespace.clone(),
                     scope: scope.clone(),
                     path: path.clone(),
+                    peers: peers.clone(),
                 };
                 map.insert(newfd, cloned);
             }
@@ -1853,10 +1877,12 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
 pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
     // Same logic as dup2 — flush tracked newfd, then propagate.
     let old_state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&newfd));
-    if let Some(FdState::Write { namespace, scope, path }) = old_state {
-        if !flush_write_fd(newfd, &namespace, &scope, &path) {
-            set_errno(libc::EIO);
-            return -1;
+    if let Some(FdState::Write { namespace, scope, path, peers }) = old_state {
+        if Arc::strong_count(&peers) == 1 {
+            if !flush_write_fd(newfd, &namespace, &scope, &path) {
+                set_errno(libc::EIO);
+                return -1;
+            }
         }
     }
 
@@ -1866,11 +1892,12 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
 
     if result >= 0 {
         if let Ok(mut map) = FD_MAP.try_lock() {
-            if let Some(FdState::Write { namespace, scope, path }) = map.get(&oldfd) {
+            if let Some(FdState::Write { namespace, scope, path, peers }) = map.get(&oldfd) {
                 let cloned = FdState::Write {
                     namespace: namespace.clone(),
                     scope: scope.clone(),
                     path: path.clone(),
+                    peers: peers.clone(),
                 };
                 map.insert(newfd, cloned);
             }
@@ -1888,16 +1915,21 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     // Remove from map first (brief lock, released before any I/O).
     let state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&fd));
 
-    if let Some(FdState::Write { namespace, scope, path }) = state {
+    if let Some(FdState::Write { namespace, scope, path, peers }) = state {
         // Sync env to remove this fd from exec tracking.
         sync_wfd_to_file();
-        if !flush_write_fd(fd, &namespace, &scope, &path) {
-            // Close the real FD but report error to caller.
-            type CloseF = unsafe extern "C" fn(c_int) -> c_int;
-            let real_close: CloseF = std::mem::transmute(dlsym_next(b"close\0"));
-            real_close(fd);
-            set_errno(libc::EIO);
-            return -1;
+        // Only flush if this is the last fd pointing to this memfd.
+        // When bash does open→dup2→close before exec (heredoc pattern),
+        // the dup'd fd still references the memfd — skip the premature flush.
+        if Arc::strong_count(&peers) == 1 {
+            if !flush_write_fd(fd, &namespace, &scope, &path) {
+                // Close the real FD but report error to caller.
+                type CloseF = unsafe extern "C" fn(c_int) -> c_int;
+                let real_close: CloseF = std::mem::transmute(dlsym_next(b"close\0"));
+                real_close(fd);
+                set_errno(libc::EIO);
+                return -1;
+            }
         }
     }
 
@@ -1919,20 +1951,70 @@ pub unsafe extern "C" fn fclose(stream: *mut libc::FILE) -> c_int {
         let fd = libc::fileno(stream);
         if fd >= 0 {
             let state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&fd));
-            if let Some(FdState::Write { namespace, scope, path }) = state {
+            if let Some(FdState::Write { namespace, scope, path, peers }) = state {
                 sync_wfd_to_file();
-                // Flush the stream to ensure all buffered content is in the memfd.
-                libc::fflush(stream);
-                // Flush fd content to API. Skip invalidate_path because this
-                // runs during process exit (via close_stdout atexit handler)
-                // and the papaya CACHE's TLS is unsafe to access during teardown.
-                flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
+                if Arc::strong_count(&peers) == 1 {
+                    // Flush the stream to ensure all buffered content is in the memfd.
+                    libc::fflush(stream);
+                    // Flush fd content to API. Skip invalidate_path because this
+                    // runs during process exit (via close_stdout atexit handler)
+                    // and the papaya CACHE's TLS is unsafe to access during teardown.
+                    flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
+                }
             }
         }
     }
     type F = unsafe extern "C" fn(*mut libc::FILE) -> c_int;
     let real: F = std::mem::transmute(dlsym_next(b"fclose\0"));
     real(stream)
+}
+
+// ---------------------------------------------------------------------------
+// _exit / _Exit — flush remaining Write fds before process terminates.
+// Bash subshells call _exit() (bypassing atexit handlers and fclose hooks).
+// Without this, content written in a subshell redirect like
+// `(echo "text") > /reevofs/output/file.txt` is lost.
+// ---------------------------------------------------------------------------
+
+/// Flush all remaining Write fds in FD_MAP to the API.
+/// Used by _exit hook to ensure no data is lost when a process terminates
+/// without going through normal close/fclose cleanup.
+unsafe fn flush_all_write_fds() {
+    let entries: Vec<(c_int, String, String, String)> = {
+        let Ok(mut map) = FD_MAP.try_lock() else { return };
+        let mut result = Vec::new();
+        // Collect and remove all Write entries.
+        let keys: Vec<c_int> = map.keys().copied().collect();
+        for fd in keys {
+            if let Some(FdState::Write { namespace, scope, path, peers }) = map.remove(&fd) {
+                // Only flush if this is the last reference to this memfd.
+                if Arc::strong_count(&peers) == 1 {
+                    result.push((fd, namespace, scope, path));
+                }
+            }
+        }
+        result
+    };
+    // Flush outside the lock to avoid deadlock.
+    for (fd, namespace, scope, path) in entries {
+        flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _exit(status: c_int) -> ! {
+    flush_all_write_fds();
+    type F = unsafe extern "C" fn(c_int) -> !;
+    let real: F = std::mem::transmute(dlsym_next(b"_exit\0"));
+    real(status)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Exit(status: c_int) -> ! {
+    flush_all_write_fds();
+    type F = unsafe extern "C" fn(c_int) -> !;
+    let real: F = std::mem::transmute(dlsym_next(b"_Exit\0"));
+    real(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -2364,8 +2446,10 @@ pub unsafe extern "C" fn syscall(
     if number == libc::SYS_close {
         let fd = a1 as c_int;
         let state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&fd));
-        if let Some(FdState::Write { namespace, scope, path }) = state {
-            flush_write_fd(fd, &namespace, &scope, &path);
+        if let Some(FdState::Write { namespace, scope, path, peers }) = state {
+            if Arc::strong_count(&peers) == 1 {
+                flush_write_fd(fd, &namespace, &scope, &path);
+            }
         }
         let real: SyscallF = std::mem::transmute(dlsym_next(b"syscall\0"));
         return real(number, a1, a2, a3, a4, a5, a6);
