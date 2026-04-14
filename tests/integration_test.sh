@@ -1641,7 +1641,81 @@ assert_ok "node.js async write + read" true
 
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
-echo "=== 30. Benchmarks ==="
+echo "=== 30. Append redirect (>>) ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# Basic append — three lines
+run bash -c 'echo "Line 1" > /reevofs/output/append_test.txt'
+run bash -c 'echo "Line 2" >> /reevofs/output/append_test.txt'
+run bash -c 'echo "Line 3" >> /reevofs/output/append_test.txt'
+GOT=$(run cat /reevofs/output/append_test.txt)
+EXPECT=$'Line 1\nLine 2\nLine 3'
+[ "$GOT" = "$EXPECT" ]
+assert_ok ">> append preserves all lines" true
+
+# Append to non-existent file (should create)
+run rm /reevofs/output/append_new.txt 2>/dev/null || true
+run bash -c 'echo "first" >> /reevofs/output/append_new.txt'
+GOT=$(run cat /reevofs/output/append_new.txt)
+[ "$GOT" = "first" ]
+assert_ok ">> append creates new file" true
+
+# Multiple appends in a single shell session
+run bash -c '
+  echo "A" > /reevofs/output/append_multi.txt
+  echo "B" >> /reevofs/output/append_multi.txt
+  echo "C" >> /reevofs/output/append_multi.txt
+  echo "D" >> /reevofs/output/append_multi.txt
+'
+GOT=$(run cat /reevofs/output/append_multi.txt)
+LINES=$(echo "$GOT" | wc -l | tr -d ' ')
+[ "$LINES" = "4" ]
+assert_ok ">> four sequential appends in one shell" true
+
+# Append with printf (no trailing newline on first two)
+run bash -c 'printf "hello " > /reevofs/output/append_printf.txt'
+run bash -c 'printf "world" >> /reevofs/output/append_printf.txt'
+GOT=$(run cat /reevofs/output/append_printf.txt)
+[ "$GOT" = "hello world" ]
+assert_ok ">> append with printf" true
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== 31. Input redirection (<) ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# wc -l with input redirect
+run bash -c 'printf "line1\nline2\nline3\n" > /reevofs/output/wc_test.txt'
+GOT=$(run bash -c 'wc -l < /reevofs/output/wc_test.txt' 2>&1)
+GOT=$(echo "$GOT" | tr -d ' ')
+[ "$GOT" = "3" ]
+assert_ok "wc -l < file" true
+
+# cat with input redirect
+run bash -c 'echo "hello redirect" > /reevofs/output/redir_test.txt'
+GOT=$(run bash -c 'cat < /reevofs/output/redir_test.txt')
+[ "$GOT" = "hello redirect" ]
+assert_ok "cat < file" true
+
+# head with input redirect
+run bash -c 'printf "a\nb\nc\nd\ne\n" > /reevofs/output/head_test.txt'
+GOT=$(run bash -c 'head -n 2 < /reevofs/output/head_test.txt')
+EXPECT=$'a\nb'
+[ "$GOT" = "$EXPECT" ]
+assert_ok "head -n 2 < file" true
+
+# Input redirect in subshell
+GOT=$(run bash -c 'echo $(wc -l < /reevofs/output/wc_test.txt)')
+GOT=$(echo "$GOT" | tr -d ' ')
+[ "$GOT" = "3" ]
+assert_ok '$(wc -l < file) subshell' true
+
+# Cleanup
+run rm /reevofs/output/append_test.txt /reevofs/output/append_new.txt /reevofs/output/append_multi.txt /reevofs/output/append_printf.txt /reevofs/output/wc_test.txt /reevofs/output/redir_test.txt /reevofs/output/head_test.txt 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== 32. Benchmarks ==="
 # ═══════════════════════════════════════════════════════════════════════
 
 bench() {

@@ -799,6 +799,12 @@ fn try_open_reevofs(path_str: &str, flags: c_int) -> Option<c_int> {
             set_errno(libc::EIO);
             return Some(-1);
         }
+        // If O_APPEND, set it on the memfd so writes go to end of existing content.
+        if (flags & libc::O_APPEND) != 0 {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, libc::O_APPEND);
+            }
+        }
         if let Ok(mut map) = FD_MAP.lock() {
             map.insert(fd, FdState::Write {
                 namespace: namespace.into(),
