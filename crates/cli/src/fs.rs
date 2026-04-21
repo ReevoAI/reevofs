@@ -300,8 +300,7 @@ impl ReevoFS {
         };
 
         match self.client.read_file(&namespace, &scope, &path) {
-            Ok(resp) => {
-                let data = resp.content.into_bytes();
+            Ok(data) => {
                 let mut inodes = self.inodes.lock().unwrap();
                 if let Some(e) = inodes.get_mut(&ino) {
                     e.content = Some(data.clone());
