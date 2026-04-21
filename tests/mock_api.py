@@ -22,6 +22,8 @@ SEED = {
     "skills/overlay/my-skill/config.json": '{"name": "my-skill", "version": "1.0"}',
     "skills/overlay/another-skill/README.md": "# Another Skill",
     "skills/overlay/hello.txt": "hello world",
+    # Raw-bytes test: 4 non-UTF-8 bytes must round-trip exactly.
+    "skills/overlay/binary.bin": bytes([0xff, 0xfe, 0xfd, 0xfc]),
     # NOTE: output namespace is intentionally NOT pre-seeded.
     # The real API returns 404 for empty namespaces, and our shim must
     # handle this by treating configured namespace roots as always-existing
@@ -73,11 +75,34 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "bad path"})
             return
 
+        # Executable extensions are blocked (matches the real backend's 415).
+        BLOCKED_EXT = (".exe", ".sh", ".bat")
+        if path.endswith(BLOCKED_EXT):
+            body = b'{"type":"about:blank","title":"Unsupported Media Type","status":415}'
+            self.send_response(415)
+            self.send_header("Content-Type", "application/problem+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         key = fs_key(ns, scope, path)
-        if key in FS:
-            self._json_response(200, {"path": path, "content": FS[key]})
-        else:
+        if key not in FS:
             self._json_response(404, {"error": "not found"})
+            return
+
+        body = FS[key]
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+            content_type = "text/plain; charset=utf-8"
+        else:
+            content_type = "application/octet-stream"
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_PUT(self):
         ns, scope, path = parse_fs_path(self.path)
