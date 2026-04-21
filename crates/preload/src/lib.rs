@@ -302,9 +302,17 @@ fn match_path(path_str: &str) -> Option<(&'static Config, &'static Namespace, &s
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// Outcome of a read that didn't produce bytes. Maps to errno at the call site.
+#[derive(Debug, Clone, Copy)]
+enum ReadError {
+    NotFound,  // 404 → ENOENT
+    Forbidden, // 403/415 → EACCES
+    Other,     // 5xx/network → ENOENT (preserves legacy behavior)
+}
+
 #[derive(Clone)]
 enum CacheEntry {
-    File { content: String, at: Instant },
+    File { content: Vec<u8>, at: Instant },
     Dir { entries: Vec<(String, bool)>, at: Instant },
     NotFound { at: Instant },
 }
@@ -372,11 +380,11 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
     drop(guard);
 
     // Cache miss — query API.
-    if let Ok(resp) = cfg.client.read_file(ns, scope, path) {
-        let size = resp.content.len();
+    if let Ok(bytes) = cfg.client.read_file(ns, scope, path) {
+        let size = bytes.len();
         debug_log!("cached_exists ns={} path={} -> IsFile({}) (read_file hit)", ns, path, size);
         CACHE.pin().insert(key, CacheEntry::File {
-            content: resp.content,
+            content: bytes,
             at: Instant::now(),
         });
         return ExistsResult::IsFile { size };
@@ -409,34 +417,36 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
     ExistsResult::NotFound
 }
 
-/// Read file content, using cache.
-fn cached_read_file(cfg: &Config, ns: &str, scope: &str, path: &str) -> Result<String, ()> {
+/// Read file content, using cache. Returns raw bytes on success and a
+/// classified error on failure so the caller can pick the right errno.
+fn cached_read_file(cfg: &Config, ns: &str, scope: &str, path: &str) -> Result<Vec<u8>, ReadError> {
     let key = cache_key(ns, scope, path);
     let guard = CACHE.pin();
     if let Some(entry) = guard.get(&key) {
         if entry.is_valid() {
             return match entry {
                 CacheEntry::File { content, .. } => Ok(content.clone()),
-                CacheEntry::NotFound { .. } => Err(()),
-                _ => Err(()), // Dir entry in a read_file path — treat as not-a-file
+                CacheEntry::NotFound { .. } => Err(ReadError::NotFound),
+                _ => Err(ReadError::NotFound), // Dir entry in a read_file path
             };
         }
     }
     drop(guard);
 
     match cfg.client.read_file(ns, scope, path) {
-        Ok(resp) => {
-            let content = resp.content;
+        Ok(bytes) => {
             CACHE.pin().insert(key, CacheEntry::File {
-                content: content.clone(),
+                content: bytes.clone(),
                 at: Instant::now(),
             });
-            Ok(content)
+            Ok(bytes)
         }
-        Err(_) => {
+        Err(reevofs_api::ApiError::NotFound) => {
             CACHE.pin().insert(key, CacheEntry::NotFound { at: Instant::now() });
-            Err(())
+            Err(ReadError::NotFound)
         }
+        Err(reevofs_api::ApiError::Forbidden) => Err(ReadError::Forbidden),
+        Err(_) => Err(ReadError::Other),
     }
 }
 
@@ -779,7 +789,11 @@ fn try_open_reevofs(path_str: &str, flags: c_int) -> Option<c_int> {
             // Check if file exists when only O_CREAT (no O_TRUNC) — fetch existing content.
             if (flags & libc::O_TRUNC) == 0 {
                 match cached_read_file(cfg, namespace, &ns_cfg.scope, api_path) {
-                    Ok(content) => create_fd_with_content(content.as_bytes()),
+                    Ok(content) => create_fd_with_content(&content),
+                    Err(ReadError::Forbidden) => {
+                        set_errno(libc::EACCES);
+                        return Some(-1);
+                    }
                     Err(_) => create_empty_fd(), // new file
                 }
             } else {
@@ -788,7 +802,11 @@ fn try_open_reevofs(path_str: &str, flags: c_int) -> Option<c_int> {
         } else {
             // O_WRONLY without O_CREAT/O_TRUNC — file must exist.
             match cached_read_file(cfg, namespace, &ns_cfg.scope, api_path) {
-                Ok(content) => create_fd_with_content(content.as_bytes()),
+                Ok(content) => create_fd_with_content(&content),
+                Err(ReadError::Forbidden) => {
+                    set_errno(libc::EACCES);
+                    return Some(-1);
+                }
                 Err(_) => {
                     set_errno(libc::ENOENT);
                     return Some(-1);
@@ -819,11 +837,15 @@ fn try_open_reevofs(path_str: &str, flags: c_int) -> Option<c_int> {
     // ── Read open (default) ──
     match cached_read_file(cfg, namespace, &ns_cfg.scope, api_path) {
         Ok(content) => {
-            let fd = create_fd_with_content(content.as_bytes());
+            let fd = create_fd_with_content(&content);
             if fd < 0 {
                 set_errno(libc::EIO);
             }
             Some(fd)
+        }
+        Err(ReadError::Forbidden) => {
+            set_errno(libc::EACCES);
+            Some(-1)
         }
         Err(_) => {
             set_errno(libc::ENOENT);
@@ -2242,17 +2264,20 @@ fn try_rename_reevofs(old_path: &str, new_path: &str) -> Option<c_int> {
         return Some(-1);
     }
 
-    // Read source content.
+    // Read source content (raw bytes).
     let content = match cfg.client.read_file(src_ns, &src_ns_cfg.scope, src_api_path) {
-        Ok(resp) => resp.content,
+        Ok(bytes) => bytes,
         Err(_) => {
             set_errno(libc::ENOENT);
             return Some(-1);
         }
     };
 
-    // Write to destination.
-    if cfg.client.write_file(dst_ns, &dst_ns_cfg.scope, dst_api_path, &content).is_err() {
+    // Write to destination. The PUT path is still JSON-based (`content: string`),
+    // so we fall back to UTF-8 lossy encoding for binary sources — this matches
+    // the existing write-buffer flush path (flush_write_fd above).
+    let text = String::from_utf8_lossy(&content);
+    if cfg.client.write_file(dst_ns, &dst_ns_cfg.scope, dst_api_path, &text).is_err() {
         set_errno(libc::EIO);
         return Some(-1);
     }
