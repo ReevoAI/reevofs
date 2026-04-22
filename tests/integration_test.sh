@@ -986,26 +986,27 @@ OUT=$(run cat /reevofs/output/mv_intra_dst.txt 2>/dev/null)
 assert_eq "mv within output ns" "intra mv" "$OUT"
 assert_fail "mv intra source gone" cat /reevofs/output/mv_intra_src.txt
 
-# mv a binary-like file (non-text content) from real fs
+# mv a binary file (all 256 byte values) from real fs — must round-trip
+# byte-for-byte via the raw-bytes PUT contract.
 python3 -c "
 with open('/tmp/binary_mv.bin', 'wb') as f:
     f.write(bytes(range(256)))
 " 2>/dev/null
+EXPECTED_MV_MD5=$(md5sum /tmp/binary_mv.bin | awk '{print $1}')
 run mv /tmp/binary_mv.bin /reevofs/output/binary_mv.bin 2>/dev/null
-OUT=$(run python3 -c "
-with open('/reevofs/output/binary_mv.bin', 'rb') as f:
-    data = f.read()
-print(len(data))
-" 2>/dev/null)
-# Note: binary content goes through UTF-8 lossy conversion — size may differ
-if [ -n "$OUT" ]; then
-    PASS=$((PASS + 1))
-    echo "  PASS: mv binary file (got ${OUT} bytes)"
-else
-    FAIL=$((FAIL + 1))
-    ERRORS="${ERRORS}\n  FAIL: mv binary file (empty output)"
-    echo "  FAIL: mv binary file"
-fi
+ACTUAL_MV_MD5=$(run cat /reevofs/output/binary_mv.bin 2>/dev/null | md5sum | awk '{print $1}')
+assert_eq "mv binary file bytes round-trip" "$EXPECTED_MV_MD5" "$ACTUAL_MV_MD5"
+
+# cp a binary file (all 256 byte values) into /reevofs/output — must round-trip
+# byte-for-byte. This exercises the flush_write_fd path on a non-UTF-8 body.
+python3 -c "
+with open('/tmp/binary_cp.bin', 'wb') as f:
+    f.write(bytes(range(256)))
+" 2>/dev/null
+EXPECTED_CP_MD5=$(md5sum /tmp/binary_cp.bin | awk '{print $1}')
+run cp /tmp/binary_cp.bin /reevofs/output/binary_cp.bin 2>/dev/null
+ACTUAL_CP_MD5=$(run cat /reevofs/output/binary_cp.bin 2>/dev/null | md5sum | awk '{print $1}')
+assert_eq "cp binary file bytes round-trip" "$EXPECTED_CP_MD5" "$ACTUAL_CP_MD5"
 
 # mv with directory path (mv /tmp/dir/ → reevofs — should fail or use files)
 mkdir -p /tmp/mv_dir_test

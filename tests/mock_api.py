@@ -110,9 +110,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "bad path"})
             return
 
+        # Executable extensions are blocked on write too (matches read 415).
+        BLOCKED_EXT = (".exe", ".sh", ".bat")
+        if path.endswith(BLOCKED_EXT):
+            body = b'{"type":"about:blank","title":"Unsupported Media Type","status":415}'
+            self.send_response(415)
+            self.send_header("Content-Type", "application/problem+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
-        content = body.get("content", "")
+        # New contract: raw bytes in the PUT body (Content-Type:
+        # application/octet-stream). Storing bytes preserves binary files.
+        content = self.rfile.read(length) if length else b""
 
         # Reject writes to scopes starting with "reject-" to simulate backend errors.
         if scope.startswith("reject-"):
