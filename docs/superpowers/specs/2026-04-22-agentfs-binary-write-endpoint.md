@@ -20,8 +20,10 @@ byte because the shim must `String::from_utf8_lossy` the bytes to fit
 them into `WriteFileRequest.content: str`.
 
 This spec proposes the symmetric write contract: raw-bytes PUT bodies
-with the same tiered (inline ≤256 KiB / S3 >256 KiB) storage policy
-and the same 415 blocklist as reads.
+up to the existing 100 MiB cap (`agentfs_max_write_bytes`), with the
+server transparently routing between inline storage (≤256 KiB) and S3
+(>256 KiB) — the same tiering the read path already exposes, but
+invisible to the client. Same 415 blocklist as reads.
 
 ## Current state
 
@@ -35,20 +37,22 @@ Content-Type: application/json
 ```
 
 - Body is forced through `str`, so binary bytes are lossy.
-- All writes hit the app server even for multi-megabyte payloads.
-- No Content-Type on the payload → the service can't sniff or
-  cache intelligently.
 - Extension blocklist (`.exe/.sh/.bat/.bin/.dll/.so/.dylib`) is only
   enforced on read — executables can be written today.
+- The 100 MiB body cap and inline-vs-S3 tiering already exist
+  server-side (`settings.agentfs_max_write_bytes`,
+  `settings.agentfs_inline_threshold_bytes`); this spec does not change
+  either.
 
 ## Proposed contract
 
-### PUT — small/medium files (inline tier)
+One endpoint, raw bytes, up to 100 MiB. The server decides inline vs S3
+based on body size — the client never sees the tier boundary.
 
 ```
 PUT /api/v2/fs/{namespace}/{scope}/{path}
 Content-Type: application/octet-stream
-Content-Length: <= 262144
+Content-Length: <= 104857600
 
 <raw bytes>
 
@@ -57,67 +61,37 @@ Content-Length: <= 262144
   Location: /api/v2/fs/{namespace}/{scope}/{path}
   Content-Type: application/json
 
-  {"path": "/...", "size_bytes": 1234, "storage": "inline"}
+  {"path": "/...", "size_bytes": 1234, "storage": "inline" | "s3"}
 ```
 
 - Body is the file's bytes, verbatim, no wrapper.
-- Size cap matches `agentfs_file.content BYTEA CHECK (octet_length <= 262144)`.
-- Server sniffs MIME from extension + magic bytes for future
-  `Content-Type` on read (same `resolve_content_type` used by the read
-  path — no new logic).
-- Response is JSON metadata. `ETag` header lets clients do optimistic
-  concurrency on subsequent writes via `If-Match`.
+- Hard cap: `agentfs_max_write_bytes` (100 MiB today). Over that → 413.
+- Server routes storage:
+  - ≤ `agentfs_inline_threshold_bytes` (256 KiB): write to
+    `agentfs_file.content BYTEA`.
+  - Above: stream the request body straight to S3 under
+    `agentfs/<org>/<uuid>`, then insert the row with
+    `storage = s3` + `s3_key` in the same transaction.
+- Server sniffs MIME from extension + magic bytes (reuses
+  `resolve_content_type` from the read path) and records it on the row
+  so subsequent reads can serve `Content-Type` without re-sniffing.
+- `storage` is returned in the response for observability only; the
+  client is not expected to branch on it.
+- `ETag` header lets clients do optimistic concurrency on subsequent
+  writes via `If-Match`.
 
-### PUT — large files (S3 tier, two-phase)
+### Streaming semantics
 
-Uploading a 50 MB CSV through the app server is wasteful. Match the
-read path's 302-to-presigned pattern, but inverted:
+The server reads the request body as a stream and writes it to S3 in
+chunks when the running total exceeds the inline threshold. Under the
+hood this means `multipart_upload` or an equivalent — no buffering the
+full 100 MiB in memory. If the stream closes before `Content-Length`
+bytes arrive, the partial S3 object is aborted and no row is inserted.
 
-**Phase 1 — initiate:**
-
-```
-POST /api/v2/fs/{namespace}/{scope}/{path}:initiate-upload
-Content-Type: application/json
-
-{"size_bytes": 52428800, "content_type": "text/csv"}
-
-→ 200
-  {
-    "upload_url": "https://s3.../?X-Amz-Signature=...",
-    "upload_method": "PUT",
-    "upload_headers": {"Content-Type": "text/csv"},
-    "finalize_url": "/api/v2/fs/{namespace}/{scope}/{path}:finalize-upload",
-    "expires_in": 300,
-    "s3_key": "agentfs/<org>/<uuid>"
-  }
-```
-
-**Phase 2 — client PUTs directly to S3**, then:
-
-**Phase 3 — finalize:**
-
-```
-POST /api/v2/fs/{namespace}/{scope}/{path}:finalize-upload
-Content-Type: application/json
-
-{"s3_key": "agentfs/<org>/<uuid>", "size_bytes": 52428800}
-
-→ 201 Created
-  ETag: "<row_id>-<updated_at_unix_ms>"
-  {"path": "/...", "size_bytes": 52428800, "storage": "s3"}
-```
-
-The finalize step verifies the object exists in S3, reads its `size_bytes`
-and `Content-Type`, then creates the `agentfs_file` row transactionally.
-If finalize never arrives, S3 lifecycle policy reaps the orphaned key
-after N days — matches the read path's presigned-URL expiry model.
-
-**Alternative simpler path for v1 — server-side proxy:** accept
-`Transfer-Encoding: chunked` on the inline PUT endpoint, stream
-straight through to S3 if size exceeds the inline cap mid-stream,
-and write `storage = s3` + `s3_key` on commit. Cheaper to implement
-(no new endpoints), more expensive in bytes-through-app-server. See
-"Open questions" below.
+This is the "server-side proxy" alternative called out as v1 in the
+earlier draft of this spec; we're committing to it as the canonical
+path. Client-direct-to-S3 (presigned PUT) is deferred — see
+"Deferred: >100 MiB" below.
 
 ### Blocklist (415)
 
@@ -144,15 +118,15 @@ upload executables and then read them back elsewhere.
 - `If-None-Match: *` → `412` if the file already exists. Useful for
   create-only semantics.
 
-### Errors (unchanged from JSON contract)
+### Errors
 
 | Status | Meaning |
 |--------|---------|
-| 400    | Bad path, bad scope, size over cap with no `:initiate-upload` |
+| 400    | Bad path, bad scope |
 | 403    | Scope forbidden for caller (auth/sandbox) |
 | 404    | Parent namespace doesn't exist |
 | 412    | `If-Match` / `If-None-Match` precondition failed |
-| 413    | Body exceeds inline cap (directs client to `:initiate-upload`) |
+| 413    | Body exceeds `agentfs_max_write_bytes` (100 MiB) |
 | 415    | Blocked extension |
 
 ## Backend changes
@@ -161,46 +135,39 @@ Modeled on PR #22934's surface area. Paths relative to `salestech-be/`.
 
 ### `salestech_be/web/api/fs/views.py`
 - `write_file` (existing `@router.put`): drop `WriteFileRequest`,
-  read body as `bytes` via `await request.body()`, enforce size cap,
+  read body as `bytes` via `await request.body()` (or stream via
+  `request.stream()` when over the inline threshold), enforce size cap,
   return `201` with `ETag` header and the new metadata JSON.
-- Add `initiate_upload` (POST `:initiate-upload`) — returns presigned
-  S3 PUT URL, validates `size_bytes` against a hard cap (e.g. 100 MiB),
-  runs blocklist, does not create a DB row.
-- Add `finalize_upload` (POST `:finalize-upload`) — HEADs the S3 key,
-  inserts the `agentfs_file` row in a transaction.
 
 ### `salestech_be/web/api/fs/schema.py`
 - Delete `WriteFileRequest` (was `content: str`).
-- Add `InitiateUploadRequest`, `InitiateUploadResponse`,
-  `FinalizeUploadRequest`, `WriteFileResponse` (with `size_bytes`,
-  `storage`, `etag`).
+- Add `WriteFileResponse` (with `path`, `size_bytes`, `storage`,
+  `etag`).
 
 ### `salestech_be/core/agentfs/file_service.py`
-- `AgentFSFileService.write_file(..., content: bytes)` — signature
-  change, route inline vs S3 on size.
-- New: `generate_write_presigned_url(s3_key, content_type, expires_in)`
-  mirroring `generate_read_presigned_url`.
-- New: `finalize_write(s3_key, size_bytes, ...)` — HEADs S3, inserts row.
+- `AgentFSFileService.write_file(..., content: bytes | AsyncIterator[bytes])`
+  — signature change, routes inline vs S3 on size.
+- Uses the existing `agentfs_inline_threshold_bytes` to decide tier.
 
 ### `salestech_be/db/dao/agentfs_repository.py`
 - `write_inline_bytes_by_row_id(row_id, content: bytes)` — was `str`.
 - `create_file_row(..., storage: AgentFSStorageType, s3_key: str | None)`.
-- `lookup_row_by_path_for_write(...)` — atomic upsert helper used by
-  both inline PUT and finalize.
+- `lookup_row_by_path_for_write(...)` — atomic upsert helper.
 
 ### `salestech_be/web/api/fs/mime.py`
-- Export the same `resolve_content_type` used on the read path; no
+- Reuse the same `resolve_content_type` used on the read path; no
   change needed, just imported from the write path.
 
 ### Tests (`tests/integration/web/api/fs/`)
 - `test_binary_write.py` — symmetric to `test_binary_read.py`:
   - inline round-trip with `\xff\xfe\xfd\xfc`
-  - 256 KiB boundary (inline) and 256 KiB + 1 byte (413 → initiate)
+  - 256 KiB boundary (inline) and 256 KiB + 1 byte (S3 tier)
+  - 100 MiB cap boundary (100 MiB + 1 byte → 413)
   - blocked extension (415)
   - `If-None-Match: *` create-only semantics
   - `If-Match` version check
-- `test_upload_lifecycle.py` — initiate + simulated S3 PUT + finalize
-  round-trip; orphan finalize (no S3 object → 400).
+- `test_binary_write_s3.py` — S3-tier write: full body streams through,
+  row gets `storage=s3`, subsequent GET follows the 302 to S3.
 
 ## Caller migration
 
@@ -223,10 +190,9 @@ Already done:
 - Unit tests (`crates/api/tests/write_raw_bytes.rs`) assert octet-stream
   header on PUT and 415 → `Forbidden`.
 
-Outstanding (gated on backend): inline > 256 KiB currently no-ops
-at the mock level — the shim does not yet know to fall back to
-`:initiate-upload`. Track in a v0.4 follow-up once the large-file
-lifecycle endpoints exist.
+The shim already handles files up to 100 MiB transparently — it PUTs
+whatever bytes it has, and the server decides where they land. No
+follow-up work needed for the inline/S3 boundary.
 
 ### webapp
 
@@ -237,7 +203,7 @@ webapp's current Artifacts path is read-only.
 ## Rollout
 
 1. **Backend PR lands with both contracts supported for ≤1 release.**
-   Inline PUT accepts both `application/json` (legacy) and
+   PUT accepts both `application/json` (legacy) and
    `application/octet-stream` (new) behind a feature flag
    `AGENTFS_BINARY_WRITE_ENABLED`. Response shape stays
    `{success, path}` when called via JSON, adds `size_bytes/storage/etag`
@@ -257,27 +223,24 @@ is smaller. Writes have more call sites (`flush_write_fd`,
 and fail more silently (mojibake, not a crash). Recommend the toggle
 for writes.
 
+## Deferred: >100 MiB
+
+For payloads over `agentfs_max_write_bytes` (100 MiB today) we would
+need either a raised cap or a client-direct-to-S3 presigned-PUT
+contract (two-phase: `:initiate-upload` → presigned S3 PUT →
+`:finalize-upload`). This is deferred. Current agent workloads
+(screenshots, PDFs, matplotlib output, small CSVs) sit comfortably
+under 100 MiB; raise the cap or add the two-phase path only if
+real workloads start hitting the limit.
+
 ## Open questions
 
-1. **Two-phase presigned PUT vs. server-side streaming for large
-   files?** Two-phase matches the read contract's presigned-URL
-   pattern and keeps large payloads off the app server; server-side
-   streaming is simpler (one endpoint) and avoids a client-side S3
-   dependency but costs app server bandwidth.
-   **Recommendation:** ship two-phase. The read path already has the
-   client-side S3 machinery (ureq follows the 302 via
-   `redirects(3)`); reusing it costs little.
-
-2. **Does the writable namespace list change?** Today only `output`
+1. **Does the writable namespace list change?** Today only `output`
    (and `skills/user`) are writable. Raw-bytes write shouldn't change
    the ACL model — same scopes, same auth checks, just a different
    body format.
 
-3. **Content-Type on write:** should the client supply it, or should
+2. **Content-Type on write:** should the client supply it, or should
    the server always sniff? The read path sniffs. For symmetry, sniff
    on write and ignore whatever the client sends, but record the
    sniffed type on the row so read can serve it without re-sniffing.
-
-4. **Chunked upload** for very large files (>100 MiB)? Not needed for
-   the current agent workload (screenshots, small PDFs); revisit if
-   users start generating multi-GB CSVs.
