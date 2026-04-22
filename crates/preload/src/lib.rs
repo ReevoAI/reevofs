@@ -1788,8 +1788,7 @@ unsafe fn flush_write_fd(fd: c_int, namespace: &str, scope: &str, path: &str) ->
     }
     if let Some(_guard) = ReentrancyGuard::try_enter() {
         if let Some(cfg) = CONFIG.as_ref() {
-            let text = String::from_utf8_lossy(&content);
-            match cfg.client.write_file(namespace, scope, path, &text) {
+            match cfg.client.write_file(namespace, scope, path, &content) {
                 Ok(_) => {
                     invalidate_path(namespace, scope, path);
                     return true;
@@ -1817,8 +1816,7 @@ unsafe fn flush_write_fd_no_invalidate(fd: c_int, namespace: &str, scope: &str, 
     }
     if let Some(_guard) = ReentrancyGuard::try_enter() {
         if let Some(cfg) = CONFIG.as_ref() {
-            let text = String::from_utf8_lossy(&content);
-            return cfg.client.write_file(namespace, scope, path, &text).is_ok();
+            return cfg.client.write_file(namespace, scope, path, &content).is_ok();
         }
     }
     true
@@ -2273,11 +2271,9 @@ fn try_rename_reevofs(old_path: &str, new_path: &str) -> Option<c_int> {
         }
     };
 
-    // Write to destination. The PUT path is still JSON-based (`content: string`),
-    // so we fall back to UTF-8 lossy encoding for binary sources — this matches
-    // the existing write-buffer flush path (flush_write_fd above).
-    let text = String::from_utf8_lossy(&content);
-    if cfg.client.write_file(dst_ns, &dst_ns_cfg.scope, dst_api_path, &text).is_err() {
+    // Write to destination. Raw bytes pass through unchanged — binary sources
+    // round-trip byte-for-byte via the octet-stream PUT contract.
+    if cfg.client.write_file(dst_ns, &dst_ns_cfg.scope, dst_api_path, &content).is_err() {
         set_errno(libc::EIO);
         return Some(-1);
     }
