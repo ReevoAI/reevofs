@@ -483,7 +483,7 @@ impl Filesystem for ReevoFS {
 
         let file_path = Self::make_child_path(&parent_path, &name_str);
 
-        match self.client.write_file(&namespace, &scope, &file_path, "") {
+        match self.client.write_file(&namespace, &scope, &file_path, &[]) {
             Ok(_) => {
                 let child_ino = self.alloc_ino();
                 let fh = self.alloc_fh();
@@ -605,15 +605,14 @@ impl Filesystem for ReevoFS {
 
         let buffers = self.write_buffers.lock().unwrap();
         if let Some(buf) = buffers.get(&fh) {
-            let content = String::from_utf8_lossy(&buf.data).to_string();
+            let data = buf.data.clone();
             let ns = buf.namespace.clone();
             let scope = buf.scope.clone();
             let path = buf.path.clone();
             drop(buffers);
 
-            match self.client.write_file(&ns, &scope, &path, &content) {
+            match self.client.write_file(&ns, &scope, &path, &data) {
                 Ok(_) => {
-                    let data = content.into_bytes();
                     let mut inodes = self.inodes.lock().unwrap();
                     if let Some(e) = inodes.get_mut(&ino) {
                         e.content = Some(data);
@@ -672,7 +671,7 @@ impl Filesystem for ReevoFS {
         let dir_path = Self::make_child_path(&parent_path, &name_str);
         let placeholder_path = format!("{}/.keep", dir_path);
 
-        match self.client.write_file(&namespace, &scope, &placeholder_path, "") {
+        match self.client.write_file(&namespace, &scope, &placeholder_path, &[]) {
             Ok(_) => {
                 let child_ino = self.alloc_ino();
                 let child_entry = InodeEntry {

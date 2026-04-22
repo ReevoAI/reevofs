@@ -17,11 +17,6 @@ pub struct ReevoClient {
 
 // -- API response types --
 
-#[derive(Debug, Serialize)]
-pub struct WriteFileRequest {
-    pub content: String,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct WriteFileResponse {
     pub success: bool,
@@ -96,7 +91,9 @@ impl ReevoClient {
     }
 
     fn add_headers(&self, req: ureq::Request) -> ureq::Request {
-        let mut req = req.set("Content-Type", "application/json");
+        // Content-Type is set per-call (send_json sets application/json for JSON
+        // bodies; write_file sets application/octet-stream for raw bytes).
+        let mut req = req;
         if !self.token.is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", self.token));
         }
@@ -148,23 +145,27 @@ impl ReevoClient {
         }
     }
 
-    /// Write (create or overwrite) a file.
+    /// Write (create or overwrite) a file with raw bytes.
+    ///
+    /// The PUT body is the file's bytes (no JSON envelope) with
+    /// `Content-Type: application/octet-stream`, so binary files round-trip
+    /// without UTF-8 conversion. Blocked extensions surface as 415 → Forbidden.
     pub fn write_file(
         &self,
         namespace: &str,
         scope: &str,
         path: &str,
-        content: &str,
+        content: &[u8],
     ) -> Result<WriteFileResponse, ApiError> {
         let url = self.fs_url(namespace, scope, path);
-        let body = WriteFileRequest {
-            content: content.to_string(),
-        };
-        let req = self.add_headers(self.agent.put(&url));
-        match req.send_json(ureq::json!(&body)) {
+        let req = self
+            .add_headers(self.agent.put(&url))
+            .set("Content-Type", "application/octet-stream");
+        match req.send_bytes(content) {
             Ok(resp) => resp.into_json::<WriteFileResponse>()
                 .map_err(|e| ApiError::Network(e.to_string())),
             Err(ureq::Error::Status(403, _)) => Err(ApiError::Forbidden),
+            Err(ureq::Error::Status(415, _)) => Err(ApiError::Forbidden),
             Err(ureq::Error::Status(400, resp)) => Err(ApiError::BadRequest(
                 resp.into_string().unwrap_or_default(),
             )),

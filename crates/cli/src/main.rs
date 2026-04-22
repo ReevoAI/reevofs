@@ -193,15 +193,18 @@ fn main() {
             path,
             content,
         } => {
-            let content = content.clone().unwrap_or_else(|| {
-                use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf).expect("failed to read stdin");
-                buf
-            });
+            let bytes: Vec<u8> = match content {
+                Some(s) => s.clone().into_bytes(),
+                None => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf).expect("failed to read stdin");
+                    buf
+                }
+            };
 
             let client = cli.client();
-            match client.write_file(namespace, scope, path, &content) {
+            match client.write_file(namespace, scope, path, &bytes) {
                 Ok(_) => info!("Written: {path}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
