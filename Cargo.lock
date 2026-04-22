@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "reevofs"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "chrono",
  "clap",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "reevofs-api"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "reevofs-preload"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "libc",
  "once_cell",
