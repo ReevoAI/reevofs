@@ -170,9 +170,16 @@ fn main() {
             scope,
             path,
         } => {
+            use std::io::Write;
             let client = cli.client();
             match client.read_file(namespace, scope, path) {
-                Ok(resp) => print!("{}", resp.content),
+                Ok(bytes) => {
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    if lock.write_all(&bytes).is_err() {
+                        std::process::exit(1);
+                    }
+                }
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);

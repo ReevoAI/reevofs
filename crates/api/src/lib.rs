@@ -2,6 +2,8 @@
 //! Uses ureq (purely synchronous, no background threads) to avoid TLS
 //! destruction panics when used from an LD_PRELOAD shim at process exit.
 
+use std::io::Read;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -14,12 +16,6 @@ pub struct ReevoClient {
 }
 
 // -- API response types --
-
-#[derive(Debug, Deserialize)]
-pub struct FileContentResponse {
-    pub path: String,
-    pub content: String,
-}
 
 #[derive(Debug, Serialize)]
 pub struct WriteFileRequest {
@@ -87,6 +83,7 @@ impl ReevoClient {
     ) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(30))
+            .redirects(3)
             .build();
 
         Self {
@@ -120,20 +117,30 @@ impl ReevoClient {
         )
     }
 
-    /// Read a file's content.
+    /// Read a file's raw bytes.
+    ///
+    /// Follows redirects (the backend returns 302 → presigned S3 URL for large
+    /// files). ureq strips the `Authorization` header across hosts by default,
+    /// so the bearer token is not leaked to S3.
     pub fn read_file(
         &self,
         namespace: &str,
         scope: &str,
         path: &str,
-    ) -> Result<FileContentResponse, ApiError> {
+    ) -> Result<Vec<u8>, ApiError> {
         let url = self.fs_url(namespace, scope, path);
         let req = self.add_headers(self.agent.get(&url));
         match req.call() {
-            Ok(resp) => resp.into_json::<FileContentResponse>()
-                .map_err(|e| ApiError::Network(e.to_string())),
+            Ok(resp) => {
+                let mut buf = Vec::new();
+                resp.into_reader()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| ApiError::Network(e.to_string()))?;
+                Ok(buf)
+            }
             Err(ureq::Error::Status(404, _)) => Err(ApiError::NotFound),
             Err(ureq::Error::Status(403, _)) => Err(ApiError::Forbidden),
+            Err(ureq::Error::Status(415, _)) => Err(ApiError::Forbidden),
             Err(ureq::Error::Status(400, resp)) => Err(ApiError::BadRequest(
                 resp.into_string().unwrap_or_default(),
             )),

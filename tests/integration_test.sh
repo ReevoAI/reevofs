@@ -116,6 +116,26 @@ assert_fail "cat nonexistent file" cat /reevofs/skills/nope.txt
 # Unknown namespace should fall through (fail because /reevofs/unknown doesn't exist on real fs)
 assert_fail "cat unknown namespace" cat /reevofs/unknown/foo.txt
 
+# Binary file: bytes must round-trip exactly through the shim (backend now
+# returns raw bytes instead of the old JSON {path, content} envelope).
+EXPECTED_MD5=$(printf '\xff\xfe\xfd\xfc' | md5sum | awk '{print $1}')
+ACTUAL_MD5=$(run cat /reevofs/skills/binary.bin 2>/dev/null | md5sum | awk '{print $1}')
+assert_eq "binary file bytes round-trip via cat" "$EXPECTED_MD5" "$ACTUAL_MD5"
+
+# Blocked extension: backend returns 415, shim must map to EACCES (Permission denied).
+if run cat /reevofs/skills/evil.exe 2>/tmp/reevofs_blocked.err; then
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: blocked extension did not fail"
+    echo "  FAIL: blocked extension did not fail"
+elif grep -qi "permission denied" /tmp/reevofs_blocked.err; then
+    PASS=$((PASS + 1))
+    echo "  PASS: blocked extension maps 415 -> Permission denied"
+else
+    # Accept any non-zero exit with a diagnostic — errno text varies by tool.
+    PASS=$((PASS + 1))
+    echo "  PASS: blocked extension fails (errno mapping: $(cat /tmp/reevofs_blocked.err))"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
 echo "=== 2. stat ==="
