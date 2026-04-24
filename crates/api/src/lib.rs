@@ -116,6 +116,11 @@ impl ReevoClient {
 
     /// Read a file's raw bytes.
     ///
+    /// Sends `Accept: application/octet-stream` so the backend returns raw
+    /// bytes rather than the legacy JSON `{path, content}` envelope. Without
+    /// this header the backend falls back to JSON and returns 415 for any
+    /// non-UTF-8 content — which silently broke stat/read of binary files.
+    ///
     /// Follows redirects (the backend returns 302 → presigned S3 URL for large
     /// files). ureq strips the `Authorization` header across hosts by default,
     /// so the bearer token is not leaked to S3.
@@ -126,7 +131,9 @@ impl ReevoClient {
         path: &str,
     ) -> Result<Vec<u8>, ApiError> {
         let url = self.fs_url(namespace, scope, path);
-        let req = self.add_headers(self.agent.get(&url));
+        let req = self
+            .add_headers(self.agent.get(&url))
+            .set("Accept", "application/octet-stream");
         match req.call() {
             Ok(resp) => {
                 let mut buf = Vec::new();

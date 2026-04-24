@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """
 Mock Reevo API server for integration testing.
-In-memory filesystem that implements:
-  GET    /api/v2/fs/{ns}/{scope}/{path}   → read file
-  PUT    /api/v2/fs/{ns}/{scope}/{path}   → write file
+
+Mirrors the real salestech-be contract documented in
+salestech_be/web/api/fs/views.py:
+  GET    /api/v2/fs/{ns}/{scope}/{path}   → read file (content negotiation
+                                            via Accept header)
+  PUT    /api/v2/fs/{ns}/{scope}/{path}   → write raw bytes
   DELETE /api/v2/fs/{ns}/{scope}/{path}   → delete file
   POST   /api/v2/fs/{ns}/{scope}/_list    → list directory
+
+Content negotiation (read path): if the client sends
+`Accept: application/octet-stream` (exact match, no wildcards), the body is
+returned as raw bytes. Otherwise the legacy JSON `{path, content}` envelope
+is returned — which requires the content to be valid UTF-8. Non-UTF-8 content
+returns 415 with a message telling the caller to retry with
+`Accept: application/octet-stream`.
+
+Blocked extensions (real backend's blocklist — .bin is included): any path
+ending in these returns 415 on both read and write regardless of content
+or Accept header.
 """
 
 import json
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote
+
+# Matches salestech_be/web/api/fs/mime.py::_BLOCKED_EXTENSIONS.
+BLOCKED_EXT = (".exe", ".sh", ".bat", ".bin", ".dll", ".so", ".dylib")
 
 # In-memory filesystem: { "skills/overlay/my-skill/SKILL.md": "content", ... }
 FS = {}
@@ -22,13 +39,30 @@ SEED = {
     "skills/overlay/my-skill/config.json": '{"name": "my-skill", "version": "1.0"}',
     "skills/overlay/another-skill/README.md": "# Another Skill",
     "skills/overlay/hello.txt": "hello world",
-    # Raw-bytes test: 4 non-UTF-8 bytes must round-trip exactly.
-    "skills/overlay/binary.bin": bytes([0xff, 0xfe, 0xfd, 0xfc]),
+    # Raw-bytes test: 4 non-UTF-8 bytes must round-trip exactly. Uses .dat
+    # because .bin is on the blocklist (matches real backend).
+    "skills/overlay/binary.dat": bytes([0xff, 0xfe, 0xfd, 0xfc]),
     # NOTE: output namespace is intentionally NOT pre-seeded.
     # The real API returns 404 for empty namespaces, and our shim must
     # handle this by treating configured namespace roots as always-existing
     # directories. Pre-seeding output data here would mask this bug.
 }
+
+
+def _wants_octet_stream(accept: str | None) -> bool:
+    """Match salestech_be/web/api/fs/views.py::_wants_octet_stream.
+
+    Only an explicit `application/octet-stream` in the Accept header opts in
+    to raw bytes. Missing header, `*/*`, `application/json`, and any other
+    value fall back to the legacy JSON envelope.
+    """
+    if not accept:
+        return False
+    for part in accept.split(","):
+        media = part.split(";", maxsplit=1)[0].strip().lower()
+        if media == "application/octet-stream":
+            return True
+    return False
 
 
 def parse_fs_path(path: str):
@@ -69,21 +103,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _problem_415(self, detail: str):
+        body = json.dumps({
+            "type": "about:blank",
+            "title": "Unsupported Media Type",
+            "status": 415,
+            "detail": detail,
+        }).encode()
+        self.send_response(415)
+        self.send_header("Content-Type", "application/problem+json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         ns, scope, path = parse_fs_path(self.path)
         if ns is None:
             self._json_response(400, {"error": "bad path"})
             return
 
-        # Executable extensions are blocked (matches the real backend's 415).
-        BLOCKED_EXT = (".exe", ".sh", ".bat")
         if path.endswith(BLOCKED_EXT):
-            body = b'{"type":"about:blank","title":"Unsupported Media Type","status":415}'
-            self.send_response(415)
-            self.send_header("Content-Type", "application/problem+json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._problem_415(
+                f"File extension '{path.rsplit('.', 1)[-1]}'"
+                f" is not served via this endpoint"
+            )
             return
 
         key = fs_key(ns, scope, path)
@@ -92,17 +135,35 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = FS[key]
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-            content_type = "text/plain; charset=utf-8"
-        else:
-            content_type = "application/octet-stream"
+        raw_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        wants_bytes = _wants_octet_stream(self.headers.get("Accept"))
 
+        if wants_bytes:
+            # Raw-bytes mode — exactly what the shim should be asking for.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(raw_bytes)))
+            self.end_headers()
+            self.wfile.write(raw_bytes)
+            return
+
+        # Legacy JSON envelope. Requires UTF-8 content; fails 415 otherwise.
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self._problem_415(
+                f"File at {path!r} is not valid UTF-8 and cannot be returned"
+                f" as JSON; retry with Accept: application/octet-stream to"
+                f" receive raw bytes"
+            )
+            return
+
+        resp = json.dumps({"path": path, "content": text}).encode()
         self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(resp)
 
     def do_PUT(self):
         ns, scope, path = parse_fs_path(self.path)
@@ -110,15 +171,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "bad path"})
             return
 
-        # Executable extensions are blocked on write too (matches read 415).
-        BLOCKED_EXT = (".exe", ".sh", ".bat")
         if path.endswith(BLOCKED_EXT):
-            body = b'{"type":"about:blank","title":"Unsupported Media Type","status":415}'
-            self.send_response(415)
-            self.send_header("Content-Type", "application/problem+json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._problem_415(
+                f"File extension '{path.rsplit('.', 1)[-1]}'"
+                f" is not served via this endpoint"
+            )
             return
 
         length = int(self.headers.get("Content-Length", 0))

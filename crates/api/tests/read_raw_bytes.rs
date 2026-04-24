@@ -19,6 +19,22 @@ fn spawn_server(response: Vec<u8>) -> (String, thread::JoinHandle<()>) {
     (url, handle)
 }
 
+/// Spawns a server that captures the request bytes and returns them on the
+/// join handle, so the test can assert what headers were sent.
+fn spawn_capturing_server(response: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        stream.write_all(&response).unwrap();
+        buf[..n].to_vec()
+    });
+    (url, handle)
+}
+
 #[test]
 fn read_file_returns_raw_bytes_including_binary() {
     let body: &[u8] = &[0xff, 0xfe, 0xfd, 0xfc];
@@ -45,4 +61,28 @@ fn read_file_maps_415_to_forbidden() {
     let err = client.read_file("ns", "scope", "/x.exe").unwrap_err();
     handle.join().unwrap();
     assert!(matches!(err, ApiError::Forbidden), "expected Forbidden, got {err:?}");
+}
+
+#[test]
+fn read_file_sends_accept_application_octet_stream() {
+    // Regression guard for v0.3.9: without this header the backend falls back
+    // to the JSON envelope and 415s any non-UTF-8 content — which silently
+    // broke stat/read of binary files through the shim.
+    let body: &[u8] = &[0xff];
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+        body.len()
+    );
+    let mut response = header.into_bytes();
+    response.extend_from_slice(body);
+
+    let (url, handle) = spawn_capturing_server(response);
+    let client = ReevoClient::new(&url, "");
+    let _ = client.read_file("ns", "scope", "/any.png").unwrap();
+    let request = handle.join().unwrap();
+    let request_str = String::from_utf8_lossy(&request);
+    assert!(
+        request_str.to_lowercase().contains("accept: application/octet-stream"),
+        "read_file must send Accept: application/octet-stream — got request:\n{request_str}"
+    );
 }
