@@ -356,6 +356,10 @@ enum ExistsResult {
     IsFile { size: usize },
     IsDir { entries: Vec<(String, bool)> },
     NotFound,
+    /// Backend returned 403/415 on the stat-probe read. Surfaced as EACCES so
+    /// callers see "Permission denied" instead of a misleading "No such file"
+    /// when an extension is blocklisted.
+    Forbidden,
 }
 
 /// Check if a file or directory exists, using cache. For stat/access paths.
@@ -373,6 +377,9 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
                 ExistsResult::IsFile { size } => format!("IsFile({})", size),
                 ExistsResult::IsDir { entries } => format!("IsDir({})", entries.len()),
                 ExistsResult::NotFound => "NotFound".into(),
+                // Forbidden is not cached (see cached_exists below) — this
+                // arm is unreachable but required for exhaustiveness.
+                ExistsResult::Forbidden => "Forbidden".into(),
             });
             return result;
         }
@@ -380,14 +387,27 @@ fn cached_exists(cfg: &Config, ns: &str, scope: &str, path: &str) -> ExistsResul
     drop(guard);
 
     // Cache miss — query API.
-    if let Ok(bytes) = cfg.client.read_file(ns, scope, path) {
-        let size = bytes.len();
-        debug_log!("cached_exists ns={} path={} -> IsFile({}) (read_file hit)", ns, path, size);
-        CACHE.pin().insert(key, CacheEntry::File {
-            content: bytes,
-            at: Instant::now(),
-        });
-        return ExistsResult::IsFile { size };
+    match cfg.client.read_file(ns, scope, path) {
+        Ok(bytes) => {
+            let size = bytes.len();
+            debug_log!("cached_exists ns={} path={} -> IsFile({}) (read_file hit)", ns, path, size);
+            CACHE.pin().insert(key, CacheEntry::File {
+                content: bytes,
+                at: Instant::now(),
+            });
+            return ExistsResult::IsFile { size };
+        }
+        Err(reevofs_api::ApiError::Forbidden) => {
+            // 403/415 — extension blocklist or auth. Surface as EACCES rather
+            // than letting the list_dir fallback swallow it and report ENOENT.
+            // Not cached: policy is cheap to re-check and could change.
+            debug_log!("cached_exists ns={} path={} -> Forbidden (read blocked)", ns, path);
+            return ExistsResult::Forbidden;
+        }
+        Err(_) => {
+            // Network / 404 / etc. — fall through to list_dir: path might be
+            // a directory, not a file.
+        }
     }
     if let Ok(resp) = cfg.client.list_dir(ns, scope, path) {
         let entries: Vec<(String, bool)> = resp.entries.iter()
@@ -928,6 +948,10 @@ fn try_stat_reevofs(path_str: &str, buf: *mut libc::stat) -> Option<c_int> {
             set_errno(libc::ENOENT);
             Some(-1)
         }
+        ExistsResult::Forbidden => {
+            set_errno(libc::EACCES);
+            Some(-1)
+        }
     }
 }
 
@@ -1013,6 +1037,10 @@ fn try_statx_reevofs(path_str: &str, mask: libc::c_uint, buf: *mut libc::statx) 
             set_errno(libc::ENOENT);
             Some(-1)
         }
+        ExistsResult::Forbidden => {
+            set_errno(libc::EACCES);
+            Some(-1)
+        }
     }
 }
 
@@ -1053,6 +1081,10 @@ fn try_access_reevofs(path_str: &str, mode: c_int) -> Option<c_int> {
         ExistsResult::IsFile { .. } | ExistsResult::IsDir { .. } => Some(0),
         ExistsResult::NotFound => {
             set_errno(libc::ENOENT);
+            Some(-1)
+        }
+        ExistsResult::Forbidden => {
+            set_errno(libc::EACCES);
             Some(-1)
         }
     }
@@ -1774,8 +1806,30 @@ pub unsafe extern "C" fn euidaccess(path: *const c_char, mode: c_int) -> c_int {
 // The fd must still be open and valid.
 // ---------------------------------------------------------------------------
 
-/// Returns true if flush succeeded (or there was nothing to flush).
-unsafe fn flush_write_fd(fd: c_int, namespace: &str, scope: &str, path: &str) -> bool {
+/// Map a failed PUT to the errno callers should set. Mirrors the read-side
+/// mapping in try_open_reevofs: Forbidden → EACCES, NotFound → ENOENT,
+/// everything else → EIO. Before this mapping every close failure surfaced
+/// as EIO regardless of cause — debugging nightmare when the real reason was
+/// a blocklisted extension or missing auth.
+fn write_error_errno(err: &reevofs_api::ApiError) -> c_int {
+    match err {
+        reevofs_api::ApiError::Forbidden => libc::EACCES,
+        reevofs_api::ApiError::NotFound => libc::ENOENT,
+        _ => libc::EIO,
+    }
+}
+
+/// Flush a write-tracked memfd to the backend.
+///
+/// `Ok(())` on success *or* when there's nothing to flush (no config, or
+/// we're re-entering the shim). `Err(errno)` carries the errno the caller
+/// should propagate to userspace.
+unsafe fn flush_write_fd(
+    fd: c_int,
+    namespace: &str,
+    scope: &str,
+    path: &str,
+) -> Result<(), c_int> {
     libc::lseek(fd, 0, libc::SEEK_SET);
     let mut content = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -1788,22 +1842,33 @@ unsafe fn flush_write_fd(fd: c_int, namespace: &str, scope: &str, path: &str) ->
     }
     if let Some(_guard) = ReentrancyGuard::try_enter() {
         if let Some(cfg) = CONFIG.as_ref() {
-            match cfg.client.write_file(namespace, scope, path, &content) {
+            return match cfg.client.write_file(namespace, scope, path, &content) {
                 Ok(_) => {
                     invalidate_path(namespace, scope, path);
-                    return true;
+                    Ok(())
                 }
-                Err(_) => return false,
-            }
+                Err(e) => {
+                    debug_log!(
+                        "flush_write_fd ns={} path={} → {:?} (errno={})",
+                        namespace, path, e, write_error_errno(&e)
+                    );
+                    Err(write_error_errno(&e))
+                }
+            };
         }
     }
-    true // No config or reentrancy — nothing to flush
+    Ok(()) // No config or reentrant — nothing to flush
 }
 
 /// Same as flush_write_fd but skips invalidate_path.
 /// Used by the fclose hook which runs during process teardown (atexit);
 /// accessing papaya's CACHE during teardown triggers a TLS panic.
-unsafe fn flush_write_fd_no_invalidate(fd: c_int, namespace: &str, scope: &str, path: &str) -> bool {
+unsafe fn flush_write_fd_no_invalidate(
+    fd: c_int,
+    namespace: &str,
+    scope: &str,
+    path: &str,
+) -> Result<(), c_int> {
     libc::lseek(fd, 0, libc::SEEK_SET);
     let mut content = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -1816,10 +1881,12 @@ unsafe fn flush_write_fd_no_invalidate(fd: c_int, namespace: &str, scope: &str, 
     }
     if let Some(_guard) = ReentrancyGuard::try_enter() {
         if let Some(cfg) = CONFIG.as_ref() {
-            return cfg.client.write_file(namespace, scope, path, &content).is_ok();
+            return cfg.client.write_file(namespace, scope, path, &content)
+                .map(|_| ())
+                .map_err(|e| write_error_errno(&e));
         }
     }
-    true
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1867,8 +1934,8 @@ pub unsafe extern "C" fn dup2(oldfd: c_int, newfd: c_int) -> c_int {
         // Prevents premature 0-byte uploads when bash does open→dup2→close
         // before the child process (e.g. cat) has written anything.
         if Arc::strong_count(&peers) == 1 {
-            if !flush_write_fd(newfd, &namespace, &scope, &path) {
-                set_errno(libc::EIO);
+            if let Err(errno) = flush_write_fd(newfd, &namespace, &scope, &path) {
+                set_errno(errno);
                 return -1;
             }
         }
@@ -1905,8 +1972,8 @@ pub unsafe extern "C" fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int
     let old_state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&newfd));
     if let Some(FdState::Write { namespace, scope, path, peers }) = old_state {
         if Arc::strong_count(&peers) == 1 {
-            if !flush_write_fd(newfd, &namespace, &scope, &path) {
-                set_errno(libc::EIO);
+            if let Err(errno) = flush_write_fd(newfd, &namespace, &scope, &path) {
+                set_errno(errno);
                 return -1;
             }
         }
@@ -1948,12 +2015,15 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         // When bash does open→dup2→close before exec (heredoc pattern),
         // the dup'd fd still references the memfd — skip the premature flush.
         if Arc::strong_count(&peers) == 1 {
-            if !flush_write_fd(fd, &namespace, &scope, &path) {
-                // Close the real FD but report error to caller.
+            if let Err(errno) = flush_write_fd(fd, &namespace, &scope, &path) {
+                // Close the real FD but report the specific error to caller:
+                // Forbidden → EACCES, NotFound → ENOENT, everything else → EIO.
+                // Before v0.3.9 this was unconditional EIO, which laundered
+                // extension-blocklist / auth failures as "I/O error".
                 type CloseF = unsafe extern "C" fn(c_int) -> c_int;
                 let real_close: CloseF = std::mem::transmute(dlsym_next(b"close\0"));
                 real_close(fd);
-                set_errno(libc::EIO);
+                set_errno(errno);
                 return -1;
             }
         }
@@ -1985,7 +2055,8 @@ pub unsafe extern "C" fn fclose(stream: *mut libc::FILE) -> c_int {
                     // Flush fd content to API. Skip invalidate_path because this
                     // runs during process exit (via close_stdout atexit handler)
                     // and the papaya CACHE's TLS is unsafe to access during teardown.
-                    flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
+                    // Ignore errno: process is exiting, nobody reads errno after fclose here.
+                    let _ = flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
                 }
             }
         }
@@ -2023,7 +2094,7 @@ unsafe fn flush_all_write_fds() {
     };
     // Flush outside the lock to avoid deadlock.
     for (fd, namespace, scope, path) in entries {
-        flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
+        let _ = flush_write_fd_no_invalidate(fd, &namespace, &scope, &path);
     }
 }
 
@@ -2475,7 +2546,12 @@ pub unsafe extern "C" fn syscall(
         let state = FD_MAP.try_lock().ok().and_then(|mut map| map.remove(&fd));
         if let Some(FdState::Write { namespace, scope, path, peers }) = state {
             if Arc::strong_count(&peers) == 1 {
-                flush_write_fd(fd, &namespace, &scope, &path);
+                // Syscall(SYS_close) path: the caller-visible errno will be
+                // whatever the kernel returns for the close(2). We've already
+                // surfaced the flush errno through the close() wrapper when
+                // libc is routed through us; here we can only attempt the
+                // upload and proceed.
+                let _ = flush_write_fd(fd, &namespace, &scope, &path);
             }
         }
         let real: SyscallF = std::mem::transmute(dlsym_next(b"syscall\0"));

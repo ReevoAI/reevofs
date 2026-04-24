@@ -116,24 +116,73 @@ assert_fail "cat nonexistent file" cat /reevofs/skills/nope.txt
 # Unknown namespace should fall through (fail because /reevofs/unknown doesn't exist on real fs)
 assert_fail "cat unknown namespace" cat /reevofs/unknown/foo.txt
 
-# Binary file: bytes must round-trip exactly through the shim (backend now
-# returns raw bytes instead of the old JSON {path, content} envelope).
+# Binary file: bytes must round-trip exactly through the shim. Uses .dat
+# since .bin is on the backend blocklist. Exercises the raw-bytes read
+# contract (Accept: application/octet-stream) end-to-end — regression guard
+# for v0.3.9 where read_file was not sending Accept and 415'd on binary.
 EXPECTED_MD5=$(printf '\xff\xfe\xfd\xfc' | md5sum | awk '{print $1}')
-ACTUAL_MD5=$(run cat /reevofs/skills/binary.bin 2>/dev/null | md5sum | awk '{print $1}')
+ACTUAL_MD5=$(run cat /reevofs/skills/binary.dat 2>/dev/null | md5sum | awk '{print $1}')
 assert_eq "binary file bytes round-trip via cat" "$EXPECTED_MD5" "$ACTUAL_MD5"
 
-# Blocked extension: backend returns 415, shim must map to EACCES (Permission denied).
-if run cat /reevofs/skills/evil.exe 2>/tmp/reevofs_blocked.err; then
-    FAIL=$((FAIL + 1))
-    ERRORS="${ERRORS}\n  FAIL: blocked extension did not fail"
-    echo "  FAIL: blocked extension did not fail"
-elif grep -qi "permission denied" /tmp/reevofs_blocked.err; then
+# Blocked extension: backend returns 415, shim must map to EACCES. Test each
+# extension in the real backend's blocklist so renames/additions there are
+# caught here.
+for BLOCKED_EXT_PROBE in exe sh bat bin dll so dylib; do
+    if run cat "/reevofs/skills/evil.$BLOCKED_EXT_PROBE" 2>/tmp/reevofs_blocked.err; then
+        FAIL=$((FAIL + 1))
+        ERRORS="${ERRORS}\n  FAIL: blocked .$BLOCKED_EXT_PROBE did not fail"
+        echo "  FAIL: blocked .$BLOCKED_EXT_PROBE did not fail"
+    elif grep -qi "permission denied" /tmp/reevofs_blocked.err; then
+        PASS=$((PASS + 1))
+        echo "  PASS: blocked .$BLOCKED_EXT_PROBE → Permission denied (EACCES)"
+    else
+        FAIL=$((FAIL + 1))
+        ERRORS="${ERRORS}\n  FAIL: blocked .$BLOCKED_EXT_PROBE errno=$(cat /tmp/reevofs_blocked.err)"
+        echo "  FAIL: blocked .$BLOCKED_EXT_PROBE wrong errno: $(cat /tmp/reevofs_blocked.err)"
+    fi
+done
+
+# Stat on binary — the specific failure mode fixed in v0.3.9. Before the fix,
+# read_file GET without explicit Accept returned 415 on binary content, and
+# cached_exists silently fell through to list_dir → NotFound → stat ENOENT.
+# After the fix, Accept: application/octet-stream is sent, GET returns 200,
+# and stat reports the file.
+if run stat /reevofs/skills/binary.dat > /dev/null 2>&1; then
     PASS=$((PASS + 1))
-    echo "  PASS: blocked extension maps 415 -> Permission denied"
+    echo "  PASS: stat on binary file works (v0.3.9 Accept fix)"
 else
-    # Accept any non-zero exit with a diagnostic — errno text varies by tool.
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: stat on binary file failed (Accept header regression?)"
+    echo "  FAIL: stat on binary file failed (Accept header regression?)"
+fi
+
+# Close-hook errno mapping (v0.3.9): writes that fail at the backend must
+# surface the right errno — Forbidden → EACCES, not a generic EIO.
+# Before v0.3.9 every flush failure became "OSError: [Errno 5] Input/output
+# error" which made it impossible to tell "extension blocked" from "network
+# timeout" from "auth failure".
+run python3 -c "
+import errno, os
+try:
+    with open('/reevofs/output/blocked.bin', 'wb') as f:
+        f.write(b'x')
+    print('UNEXPECTED_SUCCESS')
+    exit(1)
+except OSError as e:
+    if e.errno == errno.EACCES:
+        print('OK EACCES')
+        exit(0)
+    print(f'WRONG_ERRNO {e.errno} ({errno.errorcode.get(e.errno, \"?\")})')
+    exit(2)
+" > /tmp/reevofs_blocked_write.out 2>&1
+RC=$?
+if [ $RC -eq 0 ]; then
     PASS=$((PASS + 1))
-    echo "  PASS: blocked extension fails (errno mapping: $(cat /tmp/reevofs_blocked.err))"
+    echo "  PASS: write to blocked ext → EACCES (v0.3.9 close-hook errno fix)"
+else
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: write to blocked ext got wrong errno: $(cat /tmp/reevofs_blocked_write.out)"
+    echo "  FAIL: write to blocked ext: $(cat /tmp/reevofs_blocked_write.out)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -987,26 +1036,48 @@ assert_eq "mv within output ns" "intra mv" "$OUT"
 assert_fail "mv intra source gone" cat /reevofs/output/mv_intra_src.txt
 
 # mv a binary file (all 256 byte values) from real fs — must round-trip
-# byte-for-byte via the raw-bytes PUT contract.
+# byte-for-byte via the raw-bytes PUT contract. Uses .dat since .bin is
+# blocklisted by the backend.
 python3 -c "
-with open('/tmp/binary_mv.bin', 'wb') as f:
+with open('/tmp/binary_mv.dat', 'wb') as f:
     f.write(bytes(range(256)))
 " 2>/dev/null
-EXPECTED_MV_MD5=$(md5sum /tmp/binary_mv.bin | awk '{print $1}')
-run mv /tmp/binary_mv.bin /reevofs/output/binary_mv.bin 2>/dev/null
-ACTUAL_MV_MD5=$(run cat /reevofs/output/binary_mv.bin 2>/dev/null | md5sum | awk '{print $1}')
+EXPECTED_MV_MD5=$(md5sum /tmp/binary_mv.dat | awk '{print $1}')
+run mv /tmp/binary_mv.dat /reevofs/output/binary_mv.dat 2>/dev/null
+ACTUAL_MV_MD5=$(run cat /reevofs/output/binary_mv.dat 2>/dev/null | md5sum | awk '{print $1}')
 assert_eq "mv binary file bytes round-trip" "$EXPECTED_MV_MD5" "$ACTUAL_MV_MD5"
 
 # cp a binary file (all 256 byte values) into /reevofs/output — must round-trip
-# byte-for-byte. This exercises the flush_write_fd path on a non-UTF-8 body.
+# byte-for-byte. Exercises flush_write_fd on a non-UTF-8 body AND the
+# stat-before-read path that relies on Accept: application/octet-stream.
 python3 -c "
-with open('/tmp/binary_cp.bin', 'wb') as f:
+with open('/tmp/binary_cp.dat', 'wb') as f:
     f.write(bytes(range(256)))
 " 2>/dev/null
-EXPECTED_CP_MD5=$(md5sum /tmp/binary_cp.bin | awk '{print $1}')
-run cp /tmp/binary_cp.bin /reevofs/output/binary_cp.bin 2>/dev/null
-ACTUAL_CP_MD5=$(run cat /reevofs/output/binary_cp.bin 2>/dev/null | md5sum | awk '{print $1}')
+EXPECTED_CP_MD5=$(md5sum /tmp/binary_cp.dat | awk '{print $1}')
+run cp /tmp/binary_cp.dat /reevofs/output/binary_cp.dat 2>/dev/null
+ACTUAL_CP_MD5=$(run cat /reevofs/output/binary_cp.dat 2>/dev/null | md5sum | awk '{print $1}')
 assert_eq "cp binary file bytes round-trip" "$EXPECTED_CP_MD5" "$ACTUAL_CP_MD5"
+
+# Python open('wb') binary write + stat + read-back — the exact scenario that
+# failed before v0.3.9 (stat → ENOENT on binary, read → EACCES on binary).
+run python3 -c "
+import hashlib, os
+data = bytes(range(256))
+p = '/reevofs/output/pywrite_bin.png'
+with open(p, 'wb') as f: f.write(data)
+assert os.path.getsize(p) == 256, f'getsize returned {os.path.getsize(p)}'
+with open(p, 'rb') as f: got = f.read()
+assert hashlib.md5(got).hexdigest() == hashlib.md5(data).hexdigest(), 'md5 mismatch'
+" 2>/tmp/reevofs_pywb.err
+if [ $? -eq 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  PASS: python open('wb') binary write + stat + read-back"
+else
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}\n  FAIL: python binary round-trip: $(cat /tmp/reevofs_pywb.err)"
+    echo "  FAIL: python binary round-trip: $(cat /tmp/reevofs_pywb.err)"
+fi
 
 # mv with directory path (mv /tmp/dir/ → reevofs — should fail or use files)
 mkdir -p /tmp/mv_dir_test
