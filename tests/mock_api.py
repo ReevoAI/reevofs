@@ -27,8 +27,10 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote
 
-# Matches salestech_be/web/api/fs/mime.py::_BLOCKED_EXTENSIONS.
-BLOCKED_EXT = (".exe", ".sh", ".bat", ".bin", ".dll", ".so", ".dylib")
+# Matches salestech_be/web/api/fs/mime.py::_BLOCKED_EXTENSIONS exactly.
+# .sh and .bat are NOT in the production blocklist (.sh is in
+# _TEXT_FALLBACK_EXTENSIONS) — earlier mock versions over-blocked them.
+BLOCKED_EXT = (".bin", ".exe", ".dll", ".so", ".dylib")
 
 # In-memory filesystem: { "skills/overlay/my-skill/SKILL.md": "content", ... }
 FS = {}
