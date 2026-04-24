@@ -124,10 +124,10 @@ EXPECTED_MD5=$(printf '\xff\xfe\xfd\xfc' | md5sum | awk '{print $1}')
 ACTUAL_MD5=$(run cat /reevofs/skills/binary.dat 2>/dev/null | md5sum | awk '{print $1}')
 assert_eq "binary file bytes round-trip via cat" "$EXPECTED_MD5" "$ACTUAL_MD5"
 
-# Blocked extension: backend returns 415, shim must map to EACCES. Test each
-# extension in the real backend's blocklist so renames/additions there are
-# caught here.
-for BLOCKED_EXT_PROBE in exe sh bat bin dll so dylib; do
+# Blocked extensions: must match salestech_be/web/api/fs/mime.py::_BLOCKED_EXTENSIONS
+# exactly. The 5 below are blocked → backend returns 415 → shim maps to EACCES.
+# .sh and .bat are NOT blocked in production; covered by the negative cases below.
+for BLOCKED_EXT_PROBE in bin exe dll so dylib; do
     if run cat "/reevofs/skills/evil.$BLOCKED_EXT_PROBE" 2>/tmp/reevofs_blocked.err; then
         FAIL=$((FAIL + 1))
         ERRORS="${ERRORS}\n  FAIL: blocked .$BLOCKED_EXT_PROBE did not fail"
@@ -139,6 +139,22 @@ for BLOCKED_EXT_PROBE in exe sh bat bin dll so dylib; do
         FAIL=$((FAIL + 1))
         ERRORS="${ERRORS}\n  FAIL: blocked .$BLOCKED_EXT_PROBE errno=$(cat /tmp/reevofs_blocked.err)"
         echo "  FAIL: blocked .$BLOCKED_EXT_PROBE wrong errno: $(cat /tmp/reevofs_blocked.err)"
+    fi
+done
+
+# Negative cases: .sh and .bat must NOT be blocked (earlier mock had them on
+# the blocklist; production does not — .sh resolves via _TEXT_FALLBACK_EXTENSIONS).
+# We can't read these from the seed, but we can write+read them through output.
+for ALLOWED_EXT_PROBE in sh bat; do
+    run bash -c "echo not-actually-blocked > /reevofs/output/probe_allowed.$ALLOWED_EXT_PROBE" 2>/dev/null
+    OUT=$(run cat /reevofs/output/probe_allowed.$ALLOWED_EXT_PROBE 2>/dev/null)
+    if [ "$OUT" = "not-actually-blocked" ]; then
+        PASS=$((PASS + 1))
+        echo "  PASS: .$ALLOWED_EXT_PROBE is allowed (not in production blocklist)"
+    else
+        FAIL=$((FAIL + 1))
+        ERRORS="${ERRORS}\n  FAIL: .$ALLOWED_EXT_PROBE incorrectly blocked"
+        echo "  FAIL: .$ALLOWED_EXT_PROBE incorrectly blocked (read got: '$OUT')"
     fi
 done
 
