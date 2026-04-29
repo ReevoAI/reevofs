@@ -44,10 +44,10 @@ SEED = {
     # Raw-bytes test: 4 non-UTF-8 bytes must round-trip exactly. Uses .dat
     # because .bin is on the blocklist (matches real backend).
     "skills/overlay/binary.dat": bytes([0xff, 0xfe, 0xfd, 0xfc]),
-    # NOTE: output namespace is intentionally NOT pre-seeded.
-    # The real API returns 404 for empty namespaces, and our shim must
-    # handle this by treating configured namespace roots as always-existing
-    # directories. Pre-seeding output data here would mask this bug.
+    # NOTE: output and chat_attachments namespaces are intentionally NOT
+    # pre-seeded. The real API returns 404 for empty namespaces, and our shim
+    # must handle this by treating configured namespace roots as always-existing
+    # directories. Pre-seeding here would mask that bug.
 }
 
 
