@@ -14,6 +14,7 @@ export REEVO_USER_ID="test-user"
 export REEVO_ORG_ID="test-org"
 export REEVOFS_SCOPE_skills="overlay"
 export REEVOFS_SCOPE_output="test-chat-id"
+export REEVOFS_SCOPE_chat_attachments="user"
 
 LIB="${REEVOFS_PRELOAD_LIB:?Must set REEVOFS_PRELOAD_LIB}"
 
@@ -238,8 +239,8 @@ echo "=== 3. ls (directory listing) ==="
 
 # ls root
 OUT=$(run ls /reevofs/ 2>/dev/null | sort)
-# Should contain skills and output
-if echo "$OUT" | grep -q "skills" && echo "$OUT" | grep -q "output"; then
+# Should contain skills, output, and chat_attachments
+if echo "$OUT" | grep -q "skills" && echo "$OUT" | grep -q "output" && echo "$OUT" | grep -q "chat_attachments"; then
     PASS=$((PASS + 1))
     echo "  PASS: ls /reevofs/ shows namespaces"
 else
@@ -1497,6 +1498,28 @@ assert_eq "bash json → node process" "15" "$OUT"
 # Verify the node output file is readable
 OUT=$(run cat /reevofs/output/sum.txt 2>/dev/null)
 assert_eq "node output persisted" "15" "$OUT"
+
+# ═══════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== 27. chat_attachments namespace (read-only) ==="
+# ═══════════════════════════════════════════════════════════════════════
+
+# chat_attachments is not pre-seeded (matches output's empty-namespace setup).
+# These tests cover namespace registration + read-only enforcement.
+assert_ok "stat chat_attachments root" stat /reevofs/chat_attachments
+assert_ok "ls chat_attachments root" timeout 5 ls /reevofs/chat_attachments/
+
+# Read of a nonexistent path fails (real API returns 404 for empty namespaces).
+assert_fail "cat nonexistent chat_attachments file" \
+    cat /reevofs/chat_attachments/some-chat-id/req-1/upload.csv
+
+# Read-only enforcement — writes/deletes/mkdir must all fail.
+assert_fail "write to chat_attachments fails" \
+    bash -c 'echo "nope" > /reevofs/chat_attachments/some-chat-id/req-1/hack.csv'
+assert_fail "rm on chat_attachments fails" \
+    rm /reevofs/chat_attachments/some-chat-id/req-1/upload.csv
+assert_fail "mkdir on chat_attachments fails" \
+    mkdir /reevofs/chat_attachments/new-dir
 
 # ═══════════════════════════════════════════════════════════════════════
 echo ""

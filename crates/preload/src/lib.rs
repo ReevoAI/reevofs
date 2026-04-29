@@ -235,6 +235,13 @@ fn build_namespaces() -> Option<HashMap<String, Namespace>> {
         });
     }
 
+    if let Ok(scope) = std::env::var("REEVOFS_SCOPE_chat_attachments") {
+        ns.insert("chat_attachments".into(), Namespace {
+            scope,
+            access: Access::ReadOnly,
+        });
+    }
+
     if ns.is_empty() {
         return None;
     }
