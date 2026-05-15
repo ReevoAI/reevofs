@@ -285,7 +285,34 @@ echo "=== 9. mv F G (same namespace+scope) ==="
 SRC="$OUTPUT_DIR/test9-src.txt"
 DST="$OUTPUT_DIR/test9-dst.txt"
 echo "move me" > "$SRC"
+
+# Snapshot the mock's per-endpoint call counts so we can prove the rename
+# goes through ?op=rename (the BE's native endpoint) and NOT the legacy
+# GET+PUT+DELETE emulation.
+fetch_rename_count() {
+    python3 -c '
+import json
+from urllib.request import urlopen
+with urlopen("http://127.0.0.1:9876/_stats") as r:
+    print(json.load(r).get("rename", 0))
+'
+}
+RENAMES_BEFORE=$(fetch_rename_count)
+
 mv "$SRC" "$DST"
+
+RENAMES_AFTER=$(fetch_rename_count)
+RENAME_DELTA=$((RENAMES_AFTER - RENAMES_BEFORE))
+if [ "$RENAME_DELTA" -ge 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  PASS: mv invoked native ?op=rename endpoint (calls: $RENAME_DELTA)"
+else
+    FAIL=$((FAIL + 1))
+    ERRORS="${ERRORS}
+  FAIL: mv did NOT invoke native rename (delta=$RENAME_DELTA — still emulating with GET+PUT+DELETE?)"
+    echo "  FAIL: mv did NOT invoke native rename (delta=$RENAME_DELTA)"
+fi
+
 if [ -e "$SRC" ]; then
     FAIL=$((FAIL + 1))
     ERRORS="${ERRORS}

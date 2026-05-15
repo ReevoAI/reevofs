@@ -90,11 +90,14 @@ pub struct ReevoFS {
 
 /// Map a backend ApiError to the closest POSIX errno. Forbidden becomes
 /// EACCES (not EIO) so sandbox JWT scope violations surface to the caller
-/// as "permission denied" rather than a generic I/O error.
+/// as "permission denied" rather than a generic I/O error. Conflict
+/// becomes EXDEV so `mv` falls back to copy+unlink for cases the rename
+/// endpoint declines (directory renames, dest-exists-with-noreplace).
 fn api_error_to_errno(e: &ApiError) -> Errno {
     match e {
         ApiError::NotFound => Errno::ENOENT,
         ApiError::Forbidden => Errno::EACCES,
+        ApiError::Conflict => Errno::EXDEV,
         ApiError::BadRequest(_) => Errno::EINVAL,
         ApiError::Network(_) => Errno::EIO,
     }
@@ -1059,19 +1062,17 @@ impl Filesystem for ReevoFS {
         reply.error(Errno::ENOENT);
     }
 
-    /// Rename a file within the same namespace+scope.
+    /// Rename a file within the same namespace+scope. Calls the BE's
+    /// native rename endpoint
+    /// (`POST /api/v2/fs/{ns}/{scope}/{path}?op=rename`) so the operation
+    /// is atomic at the row level — no byte transfer, no window where
+    /// both paths exist, and `created_at` is preserved.
     ///
-    /// Strategy: GET source bytes → PUT to dest path → DELETE source. On
-    /// DELETE failure, attempts to roll back by DELETEing the dest. There
-    /// is a window between PUT and DELETE where both paths exist; this is
-    /// the cost of not having a native rename endpoint on the backend.
-    ///
-    /// TODO(native-rename): replace with a single POST when the BE exposes
-    /// `/api/v2/fs/{ns}/{scope}/{path}?op=rename` so we get server-side
-    /// atomicity, preserved metadata, and no double byte-transfer.
-    ///
-    /// Cross-namespace, cross-scope, and directory renames return EXDEV so
-    /// coreutils `mv` falls back to recursive copy+unlink (correct, slow).
+    /// Cross-namespace and cross-scope renames return EXDEV locally before
+    /// the network call so coreutils `mv` falls back to recursive
+    /// copy+unlink. Directory renames are surfaced as EXDEV the same way,
+    /// either pre-flight (our local check) or via a 409 from the server
+    /// mapped to EXDEV in [`api_error_to_errno`].
     fn rename(
         &self,
         _req: &Request,
@@ -1139,31 +1140,9 @@ impl Filesystem for ReevoFS {
             return;
         }
 
-        // GET → PUT → DELETE.
-        let bytes = match self.client.read_file(&src_ns, &src_scope, &src_path) {
-            Ok(b) => b,
-            Err(e) => {
-                error!("rename read {src_ns}/{src_scope}{src_path} failed: {e}");
-                reply.error(api_error_to_errno(&e));
-                return;
-            }
-        };
-
-        if let Err(e) = self.client.write_file(&src_ns, &src_scope, &dst_path, &bytes) {
-            error!("rename PUT to {src_ns}/{src_scope}{dst_path} failed: {e}");
-            reply.error(api_error_to_errno(&e));
-            return;
-        }
-
-        if let Err(e) = self.client.delete_file(&src_ns, &src_scope, &src_path) {
-            error!(
-                "rename DELETE of {src_ns}/{src_scope}{src_path} failed: {e}; rolling back PUT at {dst_path}"
-            );
-            if let Err(re) = self.client.delete_file(&src_ns, &src_scope, &dst_path) {
-                error!(
-                    "rename rollback DELETE of {dst_path} failed: {re}; duplicate copy may remain"
-                );
-            }
+        // Single atomic call to the BE's rename endpoint.
+        if let Err(e) = self.client.rename(&src_ns, &src_scope, &src_path, &dst_path) {
+            error!("rename {src_ns}/{src_scope}: {src_path} → {dst_path} failed: {e}");
             reply.error(api_error_to_errno(&e));
             return;
         }

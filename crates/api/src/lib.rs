@@ -29,6 +29,18 @@ pub struct DeleteFileResponse {
     pub path: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RenameFileRequest {
+    pub dest: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameFileResponse {
+    pub success: bool,
+    pub src: String,
+    pub dst: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DirectoryEntry {
     pub name: String,
@@ -50,6 +62,12 @@ pub struct ListDirectoryResponse {
 pub enum ApiError {
     NotFound,
     Forbidden,
+    /// 409 from a rename: dir-rename-unsupported, dest-exists-with-noreplace,
+    /// or dest is a directory. FUSE maps this to EXDEV so coreutils mv
+    /// falls back to copy+unlink. Separate from BadRequest so the FUSE
+    /// layer can distinguish "your request was malformed" (EINVAL) from
+    /// "this verb can't service this case, fall back" (EXDEV).
+    Conflict,
     BadRequest(String),
     Network(String),
 }
@@ -59,6 +77,7 @@ impl std::fmt::Display for ApiError {
         match self {
             ApiError::NotFound => write!(f, "not found"),
             ApiError::Forbidden => write!(f, "forbidden"),
+            ApiError::Conflict => write!(f, "conflict (server cannot service this rename)"),
             ApiError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             ApiError::Network(msg) => write!(f, "network error: {msg}"),
         }
@@ -218,6 +237,52 @@ impl ReevoClient {
                 .map_err(|e| ApiError::Network(e.to_string())),
             Err(ureq::Error::Status(404, _)) => Err(ApiError::NotFound),
             Err(ureq::Error::Status(403, _)) => Err(ApiError::Forbidden),
+            Err(e) => Err(ApiError::Network(e.to_string())),
+        }
+    }
+
+    /// Atomically rename `src_path` to `dest_path` within the same
+    /// namespace + scope. Backed by
+    /// `POST /api/v2/fs/{ns}/{scope}/{src_path}?op=rename`
+    /// with body `{"dest": "<dst>"}`. Server-side this is one row update
+    /// (no byte transfer, atomic, preserves `created_at`).
+    ///
+    /// Cross-namespace and cross-scope renames are NOT expressible
+    /// through this endpoint and the FUSE layer never reaches here for
+    /// those cases — it returns EXDEV locally before calling this.
+    ///
+    /// 409 → `ApiError::Conflict` (directory rename unsupported, or dest
+    /// exists with noreplace). FUSE maps this to EXDEV so `mv` falls
+    /// back to recursive copy + unlink.
+    pub fn rename(
+        &self,
+        namespace: &str,
+        scope: &str,
+        src_path: &str,
+        dest_path: &str,
+    ) -> Result<RenameFileResponse, ApiError> {
+        let clean_src = src_path.trim_start_matches('/');
+        let url = format!(
+            "{}/api/v2/fs/{}/{}/{}?op=rename",
+            self.base_url, namespace, scope, clean_src
+        );
+        let body = RenameFileRequest {
+            dest: dest_path.to_string(),
+        };
+        let req = self
+            .add_headers(self.agent.post(&url))
+            .set("Content-Type", "application/json");
+        match req.send_json(ureq::json!(&body)) {
+            Ok(resp) => resp
+                .into_json::<RenameFileResponse>()
+                .map_err(|e| ApiError::Network(e.to_string())),
+            Err(ureq::Error::Status(404, _)) => Err(ApiError::NotFound),
+            Err(ureq::Error::Status(403, _)) => Err(ApiError::Forbidden),
+            Err(ureq::Error::Status(409, _)) => Err(ApiError::Conflict),
+            Err(ureq::Error::Status(415, _)) => Err(ApiError::Forbidden),
+            Err(ureq::Error::Status(400, resp)) => Err(ApiError::BadRequest(
+                resp.into_string().unwrap_or_default(),
+            )),
             Err(e) => Err(ApiError::Network(e.to_string())),
         }
     }

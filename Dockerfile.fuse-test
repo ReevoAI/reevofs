@@ -23,7 +23,7 @@ RUN cargo build --release -p reevofs --features fuse 2>&1
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
-    bash coreutils findutils python3 \
+    bash coreutils findutils python3 curl \
     fuse3 \
     && rm -rf /var/lib/apt/lists/*
 

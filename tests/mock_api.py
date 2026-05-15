@@ -35,6 +35,11 @@ BLOCKED_EXT = (".bin", ".exe", ".dll", ".so", ".dylib")
 # In-memory filesystem: { "skills/overlay/my-skill/SKILL.md": "content", ... }
 FS = {}
 
+# Per-endpoint call counters. Lets tests assert that, e.g., `mv` actually
+# hit the native rename endpoint and didn't fall back to the GET+PUT+DELETE
+# emulation. Read via GET /_stats.
+STATS = {"get": 0, "put": 0, "delete": 0, "list": 0, "rename": 0}
+
 # Pre-seed some test data
 SEED = {
     "skills/overlay/my-skill/SKILL.md": "# My Skill\nThis is a test skill.",
@@ -119,6 +124,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # Per-endpoint call-count introspection for tests.
+        if self.path.rstrip("/") == "/_stats":
+            self._json_response(200, STATS)
+            return
+
+        STATS["get"] += 1
         ns, scope, path = parse_fs_path(self.path)
         if ns is None:
             self._json_response(400, {"error": "bad path"})
@@ -168,6 +179,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(resp)
 
     def do_PUT(self):
+        STATS["put"] += 1
         ns, scope, path = parse_fs_path(self.path)
         if ns is None:
             self._json_response(400, {"error": "bad path"})
@@ -195,6 +207,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json_response(200, {"success": True, "path": path})
 
     def do_DELETE(self):
+        STATS["delete"] += 1
         ns, scope, path = parse_fs_path(self.path)
         if ns is None:
             self._json_response(400, {"error": "bad path"})
@@ -207,15 +220,76 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json_response(404, {"error": "not found"})
 
+    def _handle_rename(self, ns, scope, src_path, query):
+        """Mirror salestech_be/web/api/fs/views.py::post_path_op (op=rename).
+
+        Files only. Atomic in the sense that the in-memory dict update
+        happens after both source-existence and dest-permission checks.
+        Directories at either side and dest-already-exists with
+        noreplace=1 return 409.
+        """
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        dest_path = body.get("dest", "").strip()
+        if not dest_path:
+            self._json_response(400, {"error": "missing dest"})
+            return
+        if not dest_path.startswith("/"):
+            dest_path = "/" + dest_path
+
+        # Blocklist applies to dest extension, same as PUT.
+        if dest_path.endswith(BLOCKED_EXT):
+            self._problem_415(
+                f"File extension '{dest_path.rsplit('.', 1)[-1]}'"
+                f" is not served via this endpoint"
+            )
+            return
+
+        src_key = fs_key(ns, scope, src_path)
+        if src_key not in FS:
+            self._json_response(404, {"error": "source not found"})
+            return
+
+        # Directory rename = 409 (FUSE falls back to copy+unlink).
+        # In our mock, a "directory" is anything that has descendants.
+        if any(k.startswith(src_key + "/") for k in FS):
+            self._json_response(409, {"error": "directory_rename_unsupported"})
+            return
+
+        noreplace = "noreplace=1" in query or "noreplace=true" in query
+        dst_key = fs_key(ns, scope, dest_path)
+        if dst_key in FS and noreplace:
+            self._json_response(409, {"error": "dest_exists"})
+            return
+
+        # Atomic in-process. Preserves the value (which on the real BE
+        # would mean preserving created_at + id).
+        FS[dst_key] = FS.pop(src_key)
+        self._json_response(200, {"success": True, "src": src_path, "dst": dest_path})
+
     def do_POST(self):
-        """Handle _list endpoint: POST /api/v2/fs/{ns}/{scope}/_list"""
-        ns, scope, fpath = parse_fs_path(self.path)
+        """Handle two POST endpoints:
+        - POST /api/v2/fs/{ns}/{scope}/_list         → list directory
+        - POST /api/v2/fs/{ns}/{scope}/{path}?op=rename → atomic rename
+        """
+        # Strip query string for routing.
+        raw_path = self.path
+        path_only, _, query = raw_path.partition("?")
+        ns, scope, fpath = parse_fs_path(path_only)
         if ns is None:
             self._json_response(400, {"error": "bad path"})
             return
 
-        # Check if this is a _list request
-        if not self.path.rstrip("/").endswith("/_list"):
+        # Rename endpoint: matches if ?op=rename is in the query string.
+        if "op=rename" in query:
+            STATS["rename"] += 1
+            self._handle_rename(ns, scope, fpath, query)
+            return
+
+        STATS["list"] += 1
+
+        # _list endpoint.
+        if not path_only.rstrip("/").endswith("/_list"):
             self._json_response(400, {"error": "unknown POST endpoint"})
             return
 
