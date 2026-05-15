@@ -3,7 +3,14 @@
 //! Mount layout:
 //!   /{namespace}/{scope}/...files...
 //!
-//! Currently: /skills/system/..., /skills/org/..., /skills/user/...
+//! Namespaces and their scopes are configured at runtime via env vars,
+//! matching the LD_PRELOAD shim conventions (executor.py):
+//!   REEVOFS_SCOPE_skills           e.g. "overlay"
+//!   REEVOFS_SCOPE_output           chat_id UUID
+//!   REEVOFS_SCOPE_chat_attachments literal "user"
+//! A namespace whose env var is unset is skipped (its directory is not
+//! mounted). If none of the env vars are set, falls back to the legacy
+//! hardcoded /skills/{system,org,user} tree for dev / standalone use.
 //!
 //! Requires the `fuse` feature and macFUSE (macOS) or libfuse (Linux).
 
@@ -16,15 +23,31 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
-    OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyWrite, Request, WriteFlags,
+    AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    WriteFlags,
 };
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 
 use reevofs_api::{ApiError, ReevoClient};
 
+/// Upper bound on `truncate -s N` growth handled in-process. A grow has to
+/// allocate `N` bytes in the FUSE daemon and PUT them, so unbounded sizes
+/// (e.g. `fallocate -l 10G`) would OOM the mount. 16 MiB covers realistic
+/// edit-parity cases (log preallocation, small JSON, SQLite pages) and
+/// stops accidental giant grows with EFBIG.
+const MAX_TRUNCATE_GROW: u64 = 16 * 1024 * 1024;
+
+/// Directory entry/attr cache TTL. Listings change infrequently enough
+/// that 5s gives noticeable readdir speedup without surprising users.
 const TTL: Duration = Duration::from_secs(5);
+/// File entry/attr cache TTL. MUST be zero. After a write+flush we update
+/// the in-memory size, but the kernel won't re-stat within the cache
+/// window — so `echo X > f; cat f` returns empty because the kernel
+/// still thinks size=0 from the create() reply. Our in-memory lookup is
+/// a single hashmap probe, so the cost of zero caching is negligible.
+const FILE_TTL: Duration = Duration::ZERO;
 const BLOCK_SIZE: u32 = 512;
 
 const ROOT_INO: u64 = 1;
@@ -65,12 +88,57 @@ pub struct ReevoFS {
     namespaces: Vec<(String, Vec<String>)>,
 }
 
-impl ReevoFS {
-    pub fn new(client: ReevoClient) -> Self {
-        let namespaces = vec![(
+/// Map a backend ApiError to the closest POSIX errno. Forbidden becomes
+/// EACCES (not EIO) so sandbox JWT scope violations surface to the caller
+/// as "permission denied" rather than a generic I/O error. Conflict
+/// becomes EXDEV so `mv` falls back to copy+unlink for cases the rename
+/// endpoint declines (directory renames, dest-exists-with-noreplace).
+fn api_error_to_errno(e: &ApiError) -> Errno {
+    match e {
+        ApiError::NotFound => Errno::ENOENT,
+        ApiError::Forbidden => Errno::EACCES,
+        ApiError::Conflict => Errno::EXDEV,
+        ApiError::BadRequest(_) => Errno::EINVAL,
+        ApiError::Network(_) => Errno::EIO,
+    }
+}
+
+/// Build the namespace mount table from REEVOFS_SCOPE_* env vars, mirroring
+/// the shim conventions in salestech-be's executor.py. Returns one
+/// `(namespace, [scope])` per configured namespace. If no env var is set,
+/// returns the legacy hardcoded skills triplet so standalone `reevofs mount`
+/// remains usable for dev.
+fn load_namespaces_from_env() -> Vec<(String, Vec<String>)> {
+    const KNOWN: &[(&str, &str)] = &[
+        ("skills", "REEVOFS_SCOPE_skills"),
+        ("output", "REEVOFS_SCOPE_output"),
+        ("chat_attachments", "REEVOFS_SCOPE_chat_attachments"),
+    ];
+    let mut configured: Vec<(String, Vec<String>)> = Vec::new();
+    for (ns, var) in KNOWN {
+        match std::env::var(var) {
+            Ok(scope) if !scope.is_empty() => {
+                info!("mount: namespace={ns} scope={scope} (from {var})");
+                configured.push(((*ns).to_string(), vec![scope]));
+            }
+            _ => {
+                debug!("mount: namespace={ns} skipped (env {var} unset)");
+            }
+        }
+    }
+    if configured.is_empty() {
+        info!("mount: no REEVOFS_SCOPE_* env vars set; falling back to legacy skills/{{system,org,user}}");
+        return vec![(
             "skills".to_string(),
             vec!["system".to_string(), "org".to_string(), "user".to_string()],
         )];
+    }
+    configured
+}
+
+impl ReevoFS {
+    pub fn new(client: ReevoClient) -> Self {
+        let namespaces = load_namespaces_from_env();
 
         let mut fs = Self {
             client,
@@ -352,42 +420,245 @@ impl Filesystem for ReevoFS {
 
         self.populate_children(parent);
 
-        let dir_children = self.dir_children.lock().unwrap();
-        if let Some(children) = dir_children.get(&parent) {
-            if let Some(&child_ino) = children.get(&name_str) {
-                let inodes = self.inodes.lock().unwrap();
-                if let Some(entry) = inodes.get(&child_ino) {
-                    let attr = match &entry.kind {
-                        InodeKind::RemoteFile { .. } => {
-                            let size = entry.content.as_ref().map(|c| c.len() as u64).unwrap_or(0);
-                            Self::file_attr(child_ino, size)
-                        }
-                        _ => Self::dir_attr(child_ino),
-                    };
-                    reply.entry(&TTL, &attr, Generation(0));
-                    return;
-                }
-            }
+        let child = {
+            let dir_children = self.dir_children.lock().unwrap();
+            dir_children.get(&parent).and_then(|c| c.get(&name_str).copied())
+        };
+
+        let Some(child_ino) = child else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        // For RemoteFile entries discovered via _list (no content cached
+        // yet), fetch on first lookup so size is accurate. Otherwise the
+        // kernel sees size=0 and `cat`/`read()` returns nothing for a
+        // file that's never been written through this mount.
+        let needs_fetch = {
+            let inodes = self.inodes.lock().unwrap();
+            matches!(
+                inodes.get(&child_ino).map(|e| (&e.kind, &e.content)),
+                Some((InodeKind::RemoteFile { .. }, None))
+            )
+        };
+        if needs_fetch {
+            self.fetch_file_content(child_ino);
         }
 
-        reply.error(Errno::ENOENT);
+        let inodes = self.inodes.lock().unwrap();
+        if let Some(entry) = inodes.get(&child_ino) {
+            match &entry.kind {
+                InodeKind::RemoteFile { .. } => {
+                    let size = entry.content.as_ref().map(|c| c.len() as u64).unwrap_or(0);
+                    reply.entry(&FILE_TTL, &Self::file_attr(child_ino, size), Generation(0));
+                }
+                _ => {
+                    reply.entry(&TTL, &Self::dir_attr(child_ino), Generation(0));
+                }
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+        }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let ino: u64 = ino.into();
         let inodes = self.inodes.lock().unwrap();
         if let Some(entry) = inodes.get(&ino) {
-            let attr = match &entry.kind {
+            match &entry.kind {
                 InodeKind::RemoteFile { .. } => {
                     let size = entry.content.as_ref().map(|c| c.len() as u64).unwrap_or(0);
-                    Self::file_attr(ino, size)
+                    reply.attr(&FILE_TTL, &Self::file_attr(ino, size));
                 }
-                _ => Self::dir_attr(ino),
-            };
-            reply.attr(&TTL, &attr);
+                _ => {
+                    reply.attr(&TTL, &Self::dir_attr(ino));
+                }
+            }
         } else {
             reply.error(Errno::ENOENT);
         }
+    }
+
+    /// Set file attributes — handles truncate, O_TRUNC, chmod, utimens, chown.
+    ///
+    /// Only `size` has real effect on the backend (truncate). Other attrs
+    /// (mode/uid/gid/atime/mtime) are accepted silently so utilities that
+    /// call `chmod`/`utimes` opportunistically (sed, vim, cp -p) don't
+    /// abort the surrounding operation. The kernel still gets the
+    /// requested values back via ReplyAttr so its attribute cache is
+    /// consistent.
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let ino: u64 = ino.into();
+        let fh: Option<u64> = fh.map(|h| h.into());
+        debug!("setattr: ino={ino}, size={size:?}, fh={fh:?}");
+
+        let snapshot = {
+            let inodes = self.inodes.lock().unwrap();
+            inodes
+                .get(&ino)
+                .map(|e| (e.kind.clone(), e.content.clone()))
+        };
+        let Some((kind, current_content)) = snapshot else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let (namespace, scope, path) = match &kind {
+            InodeKind::RemoteFile { namespace, scope, path } => {
+                (namespace.clone(), scope.clone(), path.clone())
+            }
+            // Virtual / directory inodes: accept and return dir_attr so chmod
+            // on a directory doesn't fail.
+            _ => {
+                reply.attr(&TTL, &Self::dir_attr(ino));
+                return;
+            }
+        };
+
+        // Non-size setattr (chmod/chown/utimens) — no-op.
+        let Some(new_size) = size else {
+            let cur_size = current_content.as_ref().map(|c| c.len() as u64).unwrap_or(0);
+            reply.attr(&FILE_TTL, &Self::file_attr(ino, cur_size));
+            return;
+        };
+
+        if new_size > MAX_TRUNCATE_GROW {
+            warn!(
+                "setattr: refusing size={new_size} for {namespace}/{scope}{path} (cap {MAX_TRUNCATE_GROW})"
+            );
+            reply.error(Errno::EFBIG);
+            return;
+        }
+
+        // If the truncate came from `ftruncate(fd, N)` with an open fd that
+        // already has a pending write buffer (e.g. Python r+: write() then
+        // truncate()), the kernel-buffered bytes live in our write_buffer
+        // map, not in entry.content. PUT-ing entry.content here would be
+        // overwritten by the subsequent flush of the (now-stale) buffer.
+        // Resize the buffer in place instead and let flush handle the PUT.
+        if let Some(fh) = fh {
+            let mut buffers = self.write_buffers.lock().unwrap();
+            if let Some(buf) = buffers.get_mut(&fh) {
+                buf.data.resize(new_size as usize, 0);
+                reply.attr(&FILE_TTL, &Self::file_attr(ino, new_size));
+                return;
+            }
+        }
+
+        // No pending buffer — synchronous PUT path. Used by `truncate -s`
+        // (no fd), `> file` (kernel-side O_TRUNC pre-open), and similar.
+        let current = match current_content {
+            Some(c) => c,
+            None => match self.client.read_file(&namespace, &scope, &path) {
+                Ok(b) => b,
+                Err(ApiError::NotFound) => Vec::new(),
+                Err(e) => {
+                    error!("setattr fetch {namespace}/{scope}{path} failed: {e}");
+                    reply.error(api_error_to_errno(&e));
+                    return;
+                }
+            },
+        };
+
+        let new_content = if new_size == 0 {
+            Vec::new()
+        } else if new_size <= current.len() as u64 {
+            current[..new_size as usize].to_vec()
+        } else {
+            let mut v = current;
+            v.resize(new_size as usize, 0);
+            v
+        };
+
+        match self.client.write_file(&namespace, &scope, &path, &new_content) {
+            Ok(_) => {
+                let final_size = new_content.len() as u64;
+                {
+                    let mut inodes = self.inodes.lock().unwrap();
+                    if let Some(e) = inodes.get_mut(&ino) {
+                        e.content = Some(new_content);
+                        e.cache_time = Some(SystemTime::now());
+                    }
+                }
+                reply.attr(&FILE_TTL, &Self::file_attr(ino, final_size));
+            }
+            Err(e) => {
+                error!("setattr PUT {namespace}/{scope}{path} failed: {e}");
+                reply.error(api_error_to_errno(&e));
+            }
+        }
+    }
+
+    /// Allocate a unique file handle per open so concurrent opens of
+    /// different inodes don't collide on fh=0 (the default impl). The
+    /// per-fh write buffer is created lazily on the first write — read-only
+    /// opens never allocate one.
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let fh = self.alloc_fh();
+        reply.opened(FileHandle(fh), FopenFlags::empty());
+    }
+
+    /// We don't enforce POSIX permissions in the FUSE layer — the backend
+    /// is authoritative (sandbox JWT scope, 403 → EACCES at the write
+    /// path). Returning ok here lets `test -w`, `access(F_OK)`, and
+    /// editors that pre-check writability proceed.
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    /// Synthetic filesystem stats — there's no underlying block device.
+    /// Reports 1 TiB total with most of it free, and 1M inodes free, so
+    /// `df` and installers that gate on free-space checks proceed.
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let bsize: u32 = 4096;
+        let blocks: u64 = (1u64 << 40) / bsize as u64; // 1 TiB
+        reply.statfs(blocks, blocks, blocks, 1_000_000, 1_000_000, bsize, 255, bsize);
+    }
+
+    /// fsync is redundant for us — every `flush` already PUTs bytes to the
+    /// backend synchronously, so there are no in-kernel dirty pages we
+    /// need to push. Default would return ENOSYS, which makes
+    /// safety-conscious apps (vim with `set fsync`, sqlite, atomic-write
+    /// libraries) fail their save path.
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    /// Same reasoning as fsync — directory state is whatever the backend
+    /// reports; there's nothing to sync client-side.
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
     }
 
     fn readdir(
@@ -524,11 +795,11 @@ impl Filesystem for ReevoFS {
                 );
 
                 let attr = Self::file_attr(child_ino, 0);
-                reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+                reply.created(&FILE_TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
             }
             Err(e) => {
                 error!("create failed: {e}");
-                reply.error(Errno::EIO);
+                reply.error(api_error_to_errno(&e));
             }
         }
     }
@@ -622,7 +893,7 @@ impl Filesystem for ReevoFS {
                 }
                 Err(e) => {
                     error!("flush write_file failed: {e}");
-                    reply.error(Errno::EIO);
+                    reply.error(api_error_to_errno(&e));
                 }
             }
         } else {
@@ -704,7 +975,7 @@ impl Filesystem for ReevoFS {
             }
             Err(e) => {
                 error!("mkdir failed: {e}");
-                reply.error(Errno::EIO);
+                reply.error(api_error_to_errno(&e));
             }
         }
     }
@@ -738,7 +1009,7 @@ impl Filesystem for ReevoFS {
                         }
                         Err(e) => {
                             error!("unlink failed: {e}");
-                            reply.error(Errno::EIO);
+                            reply.error(api_error_to_errno(&e));
                             return;
                         }
                     }
@@ -781,7 +1052,7 @@ impl Filesystem for ReevoFS {
                         }
                         Err(e) => {
                             error!("rmdir failed: {e}");
-                            reply.error(Errno::EIO);
+                            reply.error(api_error_to_errno(&e));
                             return;
                         }
                     }
@@ -789,5 +1060,134 @@ impl Filesystem for ReevoFS {
             }
         }
         reply.error(Errno::ENOENT);
+    }
+
+    /// Rename a file within the same namespace+scope. Calls the BE's
+    /// native rename endpoint
+    /// (`POST /api/v2/fs/{ns}/{scope}/{path}?op=rename`) so the operation
+    /// is atomic at the row level — no byte transfer, no window where
+    /// both paths exist, and `created_at` is preserved.
+    ///
+    /// Cross-namespace and cross-scope renames return EXDEV locally before
+    /// the network call so coreutils `mv` falls back to recursive
+    /// copy+unlink. Directory renames are surfaced as EXDEV the same way,
+    /// either pre-flight (our local check) or via a 409 from the server
+    /// mapped to EXDEV in [`api_error_to_errno`].
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let parent: u64 = parent.into();
+        let newparent: u64 = newparent.into();
+        let name_str = name.to_string_lossy().to_string();
+        let newname_str = newname.to_string_lossy().to_string();
+        debug!("rename: {parent}/{name_str} -> {newparent}/{newname_str}");
+
+        let Some((src_ns, src_scope, _src_parent_path)) = self.resolve_parent(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some((dst_ns, dst_scope, dst_parent_path)) = self.resolve_parent(newparent) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if src_ns != dst_ns || src_scope != dst_scope {
+            debug!("rename: cross-namespace/scope -> EXDEV");
+            reply.error(Errno::EXDEV);
+            return;
+        }
+
+        let src_ino = {
+            let dc = self.dir_children.lock().unwrap();
+            dc.get(&parent).and_then(|c| c.get(&name_str).copied())
+        };
+        let Some(src_ino) = src_ino else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let src_kind = {
+            let inodes = self.inodes.lock().unwrap();
+            inodes.get(&src_ino).map(|e| e.kind.clone())
+        };
+        let (src_path, is_file) = match src_kind {
+            Some(InodeKind::RemoteFile { path, .. }) => (path, true),
+            Some(InodeKind::RemoteDir { path, .. }) => (path, false),
+            _ => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+
+        let dst_path = Self::make_child_path(&dst_parent_path, &newname_str);
+
+        // Self-rename: short-circuit before any HTTP.
+        if src_path == dst_path && parent == newparent {
+            reply.ok();
+            return;
+        }
+
+        if !is_file {
+            debug!("rename: directory rename not supported natively -> EXDEV for copy+unlink fallback");
+            reply.error(Errno::EXDEV);
+            return;
+        }
+
+        // Single atomic call to the BE's rename endpoint.
+        if let Err(e) = self.client.rename(&src_ns, &src_scope, &src_path, &dst_path) {
+            error!("rename {src_ns}/{src_scope}: {src_path} → {dst_path} failed: {e}");
+            reply.error(api_error_to_errno(&e));
+            return;
+        }
+
+        // Backend state is consistent — update the inode tree atomically.
+        {
+            let mut inodes = self.inodes.lock().unwrap();
+            let mut dc = self.dir_children.lock().unwrap();
+
+            if let Some(children) = dc.get_mut(&parent) {
+                children.remove(&name_str);
+            }
+
+            // Overwrite case: if dst already had an inode, drop it (the PUT
+            // replaced its contents; the kernel will re-lookup and find the
+            // moved source inode under the new name).
+            let existing_dst = dc
+                .get(&newparent)
+                .and_then(|c| c.get(&newname_str).copied());
+            if let Some(old_dst_ino) = existing_dst {
+                if old_dst_ino != src_ino {
+                    inodes.remove(&old_dst_ino);
+                }
+            }
+
+            if let Some(entry) = inodes.get_mut(&src_ino) {
+                entry.kind = InodeKind::RemoteFile {
+                    namespace: src_ns.clone(),
+                    scope: src_scope.clone(),
+                    path: dst_path.clone(),
+                };
+                // Bust the cached body so a stale read of the renamed
+                // inode (kernel hands us the moved ino) doesn't return
+                // pre-rename bytes if a writer mutates dst out-of-band.
+                entry.cache_time = None;
+            }
+
+            dc.entry(newparent).or_default().insert(newname_str, src_ino);
+        }
+
+        self.invalidate_cache(parent);
+        if parent != newparent {
+            self.invalidate_cache(newparent);
+        }
+
+        reply.ok();
     }
 }
