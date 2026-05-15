@@ -1,0 +1,47 @@
+# FUSE integration test container.
+#
+# Runs the mock Reevo API on port 9876, mounts ReevoFS via libfuse3 at
+# /mnt/reevofs, and executes the edit-parity acceptance matrix in
+# tests/fuse_integration_test.sh.
+#
+# Requires the host to grant the container CAP_SYS_ADMIN and /dev/fuse:
+#   docker build -f Dockerfile.fuse-test -t reevofs-fuse-test .
+#   docker run --rm --cap-add SYS_ADMIN --device /dev/fuse reevofs-fuse-test
+
+# Stage 1: Build the reevofs binary with --features fuse
+FROM rust:1.93-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    fuse3 libfuse3-dev pkg-config cmake g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p reevofs --features fuse 2>&1
+
+# Stage 2: Test runtime — fuse3 userspace + python for the mock API
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    bash coreutils findutils python3 \
+    fuse3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Allow non-root mounts (kernel-level allow_other if ever enabled).
+RUN sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || true
+
+WORKDIR /app
+COPY --from=builder /app/target/release/reevofs /usr/local/bin/reevofs
+COPY tests/ tests/
+
+CMD ["bash", "-c", "\
+    python3 tests/mock_api.py 9876 & \
+    MOCK_PID=$! && \
+    sleep 1 && \
+    REEVOFS_BIN=/usr/local/bin/reevofs \
+    MOUNT_POINT=/mnt/reevofs \
+    bash tests/fuse_integration_test.sh; \
+    RC=$?; \
+    kill $MOCK_PID 2>/dev/null; \
+    exit $RC \
+"]
