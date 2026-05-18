@@ -2306,7 +2306,13 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: libc::mode_t) -> c_int
 }
 
 // ---------------------------------------------------------------------------
-// Core rename logic — implemented as read→write→delete (no server-side rename API)
+// Core rename logic. For same (namespace, scope) renames, calls the BE's
+// native ?op=rename endpoint (one HTTP round trip, atomic at the row level,
+// preserves created_at). Cross-namespace and cross-scope renames between two
+// /reevofs/ paths fall back to GET+PUT+conditional-DELETE — the backend has
+// no atomic rename across scopes, and the shim has historically supported
+// this as a copy-style operation that agents rely on (e.g., moving a
+// generated file from /output/ into /skills/).
 // ---------------------------------------------------------------------------
 
 fn try_rename_reevofs(old_path: &str, new_path: &str) -> Option<c_int> {
@@ -2334,13 +2340,53 @@ fn try_rename_reevofs(old_path: &str, new_path: &str) -> Option<c_int> {
     let (cfg, src_ns_cfg, src_ns, src_api_path) = match_path(old_path)?;
     let (_cfg2, dst_ns_cfg, dst_ns, dst_api_path) = match_path(new_path)?;
 
-    // Source must be readable, destination must be writable.
+    // Destination must be writable.
     if dst_ns_cfg.access != Access::ReadWrite {
         set_errno(libc::EACCES);
         return Some(-1);
     }
 
-    // Read source content (raw bytes).
+    // Same (namespace, scope) — use the native rename endpoint.
+    if src_ns == dst_ns && src_ns_cfg.scope == dst_ns_cfg.scope {
+        // Native rename deletes the source row, so source ns must be writable.
+        if src_ns_cfg.access != Access::ReadWrite {
+            set_errno(libc::EACCES);
+            return Some(-1);
+        }
+        return match cfg.client.rename(src_ns, &src_ns_cfg.scope, src_api_path, dst_api_path) {
+            Ok(_) => {
+                invalidate_path(src_ns, &src_ns_cfg.scope, src_api_path);
+                invalidate_path(dst_ns, &dst_ns_cfg.scope, dst_api_path);
+                Some(0)
+            }
+            Err(reevofs_api::ApiError::NotFound) => {
+                set_errno(libc::ENOENT);
+                Some(-1)
+            }
+            Err(reevofs_api::ApiError::Forbidden) => {
+                set_errno(libc::EACCES);
+                Some(-1)
+            }
+            // 409 — directory rename or dest-exists-with-noreplace. Map to
+            // EXDEV so coreutils mv falls back to recursive copy+unlink.
+            Err(reevofs_api::ApiError::Conflict) => {
+                set_errno(libc::EXDEV);
+                Some(-1)
+            }
+            Err(_) => {
+                set_errno(libc::EIO);
+                Some(-1)
+            }
+        };
+    }
+
+    // Cross-namespace or cross-scope: emulate. The BE has no atomic rename
+    // across scopes, and agents historically rely on this as a copy-style
+    // operation (e.g., moving a generated file from output → skills, where
+    // skills is read-only and source preservation is the desired behavior).
+    //
+    // GET source → PUT to dest. Delete source only if its namespace allows
+    // writes (so /skills → /output leaves the skill in place).
     let content = match cfg.client.read_file(src_ns, &src_ns_cfg.scope, src_api_path) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -2349,15 +2395,12 @@ fn try_rename_reevofs(old_path: &str, new_path: &str) -> Option<c_int> {
         }
     };
 
-    // Write to destination. Raw bytes pass through unchanged — binary sources
-    // round-trip byte-for-byte via the octet-stream PUT contract.
     if cfg.client.write_file(dst_ns, &dst_ns_cfg.scope, dst_api_path, &content).is_err() {
         set_errno(libc::EIO);
         return Some(-1);
     }
     invalidate_path(dst_ns, &dst_ns_cfg.scope, dst_api_path);
 
-    // Delete source (only if source namespace is writable).
     if src_ns_cfg.access == Access::ReadWrite {
         let _ = cfg.client.delete_file(src_ns, &src_ns_cfg.scope, src_api_path);
         invalidate_path(src_ns, &src_ns_cfg.scope, src_api_path);
