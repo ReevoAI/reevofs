@@ -48,11 +48,17 @@ SEED = {
     "skills/overlay/hello.txt": "hello world",
     # Raw-bytes test: 4 non-UTF-8 bytes must round-trip exactly. Uses .dat
     # because .bin is on the blocklist (matches real backend).
-    "skills/overlay/binary.dat": bytes([0xff, 0xfe, 0xfd, 0xfc]),
-    # NOTE: output and chat_attachments namespaces are intentionally NOT
-    # pre-seeded. The real API returns 404 for empty namespaces, and our shim
-    # must handle this by treating configured namespace roots as always-existing
-    # directories. Pre-seeding here would mask that bug.
+    "skills/overlay/binary.dat": bytes([0xFF, 0xFE, 0xFD, 0xFC]),
+    # chat_attachments read fixture. Scope is the literal "user"; the chat_id
+    # and message-request id are part of the *path*, not the scope. Lets the
+    # FUSE test verify the single-scope collapse injects scope=user, so the
+    # agent's /reevofs/chat_attachments/<chat_id>/<req>/<file> path resolves to
+    # chat_attachments/user/<chat_id>/<req>/<file> on the backend.
+    "chat_attachments/user/test-chat-id/req-1/leads.csv": "name,score\nacme,42",
+    # NOTE: the output namespace is intentionally NOT pre-seeded. The real API
+    # returns 404 for empty namespaces, and our mount must handle this by
+    # treating configured namespace roots as always-existing directories.
+    # Pre-seeding output here would mask that bug.
 }
 
 
@@ -78,7 +84,7 @@ def parse_fs_path(path: str):
     prefix = "/api/v2/fs/"
     if not path.startswith(prefix):
         return None, None, None
-    rest = path[len(prefix):]
+    rest = path[len(prefix) :]
     parts = rest.split("/", 2)
     if len(parts) < 2:
         return None, None, None
@@ -111,12 +117,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _problem_415(self, detail: str):
-        body = json.dumps({
-            "type": "about:blank",
-            "title": "Unsupported Media Type",
-            "status": 415,
-            "detail": detail,
-        }).encode()
+        body = json.dumps(
+            {
+                "type": "about:blank",
+                "title": "Unsupported Media Type",
+                "status": 415,
+                "detail": detail,
+            }
+        ).encode()
         self.send_response(415)
         self.send_header("Content-Type", "application/problem+json")
         self.send_header("Content-Length", str(len(body)))
@@ -306,7 +314,7 @@ class Handler(BaseHTTPRequestHandler):
         for key in FS:
             if not key.startswith(prefix + "/") and key != prefix:
                 continue
-            rest = key[len(prefix):].strip("/")
+            rest = key[len(prefix) :].strip("/")
             if not rest:
                 continue
             # First component is the immediate child
@@ -323,8 +331,13 @@ class Handler(BaseHTTPRequestHandler):
         # where the shim incorrectly treats empty list_dir results as valid
         # directories (e.g. the cp/mv nested path bug with O_DIRECTORY probe).
 
-        result = [{"name": name, "is_directory": is_dir} for name, is_dir in sorted(entries.items())]
-        self._json_response(200, {"path": f"/{list_path}" if list_path else "/", "entries": result})
+        result = [
+            {"name": name, "is_directory": is_dir}
+            for name, is_dir in sorted(entries.items())
+        ]
+        self._json_response(
+            200, {"path": f"/{list_path}" if list_path else "/", "entries": result}
+        )
 
 
 def main():
