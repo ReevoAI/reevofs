@@ -10,10 +10,12 @@
 #   - Mock API server (tests/mock_api.py) already running on port 9876
 #   - Container has /dev/fuse and CAP_SYS_ADMIN (docker run --cap-add SYS_ADMIN --device /dev/fuse)
 #
-# Mount layout (driven by REEVOFS_SCOPE_* env vars):
-#   /mnt/reevofs/skills/overlay/...
-#   /mnt/reevofs/output/<chat_id>/...
-#   /mnt/reevofs/chat_attachments/user/...
+# Mount layout (driven by REEVOFS_SCOPE_* env vars). Each namespace is single-
+# scope, so the scope is collapsed (the namespace dir IS the scope root, just
+# like the LD_PRELOAD shim — see fs.rs):
+#   /mnt/reevofs/skills/...            → skills/overlay/...
+#   /mnt/reevofs/output/...            → output/<chat_id>/...
+#   /mnt/reevofs/chat_attachments/...  → chat_attachments/user/...
 
 set -uo pipefail
 
@@ -28,12 +30,11 @@ export REEVOFS_SCOPE_skills="overlay"
 export REEVOFS_SCOPE_output="test-chat-id"
 export REEVOFS_SCOPE_chat_attachments="user"
 
-# FUSE mount layout exposes scope as a directory level. Shim uses /output/file
-# transparently because it translates the namespace's env-var scope into the
-# URL path; FUSE shows the scope dir explicitly so cross-scope renames have
-# somewhere to be EXDEV against.
-OUTPUT_DIR="$MOUNT_POINT/output/test-chat-id"
-SKILLS_DIR="$MOUNT_POINT/skills/overlay"
+# Single-scope namespaces collapse the scope level, so the agent uses the same
+# paths under FUSE as under the shim: /reevofs/output/<file> maps to the backend
+# as output/<chat_id>/<file> (scope injected, not navigated).
+OUTPUT_DIR="$MOUNT_POINT/output"
+SKILLS_DIR="$MOUNT_POINT/skills"
 
 PASS=0
 FAIL=0
@@ -651,13 +652,21 @@ data" "$OUT"
 
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
-echo "=== 25. chat_attachments namespace read ==="
+echo "=== 25. chat_attachments namespace read (scope=user collapsed) ==="
 # ═══════════════════════════════════════════════════════════════════════
 
-# chat_attachments is mounted but read-only in real deployments. Verify
-# stat works (regression for the "namespace skipped when env unset" path).
-assert_ok "stat chat_attachments/user scope" stat "$MOUNT_POINT/chat_attachments/user"
-assert_ok "ls chat_attachments/user" ls "$MOUNT_POINT/chat_attachments/user/"
+# chat_attachments is single-scope ("user"), so the namespace dir IS the scope
+# root. The agent reads it via the same path the descriptions document —
+# /reevofs/chat_attachments/<chat_id>/<req>/<file>, with NO "user" segment —
+# and the collapsed mount injects scope=user so the backend sees
+# chat_attachments/user/<chat_id>/<req>/<file>. (Pre-fix, this path resolved
+# <chat_id> as the scope and the backend rejected it with EACCES.)
+assert_ok "stat chat_attachments namespace root" stat "$MOUNT_POINT/chat_attachments"
+# Mock pre-seeds chat_attachments/user/test-chat-id/req-1/leads.csv.
+ATTACH="$MOUNT_POINT/chat_attachments/test-chat-id/req-1/leads.csv"
+assert_eq "read chat_attachment via agent path (scope=user injected)" \
+    "name,score
+acme,42" "$(cat "$ATTACH" 2>/dev/null)"
 
 # ═══════════════════════════════════════════════════════════════════════
 echo ""

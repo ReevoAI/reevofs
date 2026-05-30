@@ -1,16 +1,22 @@
 //! FUSE filesystem backed by the Reevo API.
 //!
 //! Mount layout:
-//!   /{namespace}/{scope}/...files...
+//!   /{namespace}/...files...           single-scope namespace (scope injected,
+//!                                       matches the LD_PRELOAD shim)
+//!   /{namespace}/{scope}/...files...   multi-scope namespace (scope is a
+//!                                       navigable subdir; legacy dev fallback)
 //!
 //! Namespaces and their scopes are configured at runtime via env vars,
 //! matching the LD_PRELOAD shim conventions (executor.py):
 //!   REEVOFS_SCOPE_skills           e.g. "overlay"
 //!   REEVOFS_SCOPE_output           chat_id UUID
 //!   REEVOFS_SCOPE_chat_attachments literal "user"
-//! A namespace whose env var is unset is skipped (its directory is not
-//! mounted). If none of the env vars are set, falls back to the legacy
-//! hardcoded /skills/{system,org,user} tree for dev / standalone use.
+//! Each maps to a single scope, so the namespace directory IS the scope root
+//! (e.g. /reevofs/output/report.csv → output/<chat_id>/report.csv) — identical
+//! to how the shim injects the scope, so the same paths work under both. A
+//! namespace whose env var is unset is skipped (its directory is not mounted).
+//! If none of the env vars are set, falls back to the legacy hardcoded
+//! /skills/{system,org,user} tree (multi-scope, scope-as-subdir) for dev.
 //!
 //! Requires the `fuse` feature and macFUSE (macOS) or libfuse (Linux).
 
@@ -166,9 +172,32 @@ impl ReevoFS {
 
         for (ns_name, scopes) in &self.namespaces {
             let ns_ino = self.alloc_ino();
+
+            // Single-scope namespaces collapse the scope level: the namespace
+            // directory IS the scope root, so /reevofs/<ns>/<path> maps directly
+            // to (ns, scope, path). This matches the LD_PRELOAD shim, which
+            // injects the scope from env rather than exposing it as a navigable
+            // subdir. Without this, paths written for the shim (e.g.
+            // /reevofs/output/report.csv) resolve their first segment as the
+            // *scope* and hit the wrong backend path. The production namespaces
+            // (output, skills, chat_attachments) are always single-scope.
+            //
+            // Multi-scope namespaces (the legacy dev skills/{system,org,user}
+            // fallback) keep the explicit scope subdir tree below — that's the
+            // only case where a cross-scope rename within a namespace is even
+            // expressible and needs a scope dir to be EXDEV against. Cross-
+            // namespace renames remain EXDEV either way (namespaces stay
+            // separate directories).
+            let ns_kind = match scopes.as_slice() {
+                [single] => InodeKind::Scope {
+                    namespace: ns_name.clone(),
+                    scope: single.clone(),
+                },
+                _ => InodeKind::Namespace { name: ns_name.clone() },
+            };
             let ns_entry = InodeEntry {
                 ino: ns_ino,
-                kind: InodeKind::Namespace { name: ns_name.clone() },
+                kind: ns_kind,
                 children: Vec::new(),
                 content: None,
                 cache_time: None,
@@ -179,23 +208,28 @@ impl ReevoFS {
             self.inodes.get_mut().unwrap().get_mut(&ROOT_INO).unwrap().children.push(ns_ino);
             self.dir_children.get_mut().unwrap().get_mut(&ROOT_INO).unwrap().insert(ns_name.clone(), ns_ino);
 
-            for scope_name in scopes {
-                let scope_ino = self.alloc_ino();
-                let scope_entry = InodeEntry {
-                    ino: scope_ino,
-                    kind: InodeKind::Scope {
-                        namespace: ns_name.clone(),
-                        scope: scope_name.clone(),
-                    },
-                    children: Vec::new(),
-                    content: None,
-                    cache_time: None,
-                };
-                self.inodes.get_mut().unwrap().insert(scope_ino, scope_entry);
-                self.dir_children.get_mut().unwrap().insert(scope_ino, HashMap::new());
+            // Only multi-scope namespaces expose explicit scope subdirs; for a
+            // single-scope namespace the namespace inode (created above as a
+            // Scope) already is the scope root.
+            if scopes.len() > 1 {
+                for scope_name in scopes {
+                    let scope_ino = self.alloc_ino();
+                    let scope_entry = InodeEntry {
+                        ino: scope_ino,
+                        kind: InodeKind::Scope {
+                            namespace: ns_name.clone(),
+                            scope: scope_name.clone(),
+                        },
+                        children: Vec::new(),
+                        content: None,
+                        cache_time: None,
+                    };
+                    self.inodes.get_mut().unwrap().insert(scope_ino, scope_entry);
+                    self.dir_children.get_mut().unwrap().insert(scope_ino, HashMap::new());
 
-                self.inodes.get_mut().unwrap().get_mut(&ns_ino).unwrap().children.push(scope_ino);
-                self.dir_children.get_mut().unwrap().get_mut(&ns_ino).unwrap().insert(scope_name.clone(), scope_ino);
+                    self.inodes.get_mut().unwrap().get_mut(&ns_ino).unwrap().children.push(scope_ino);
+                    self.dir_children.get_mut().unwrap().get_mut(&ns_ino).unwrap().insert(scope_name.clone(), scope_ino);
+                }
             }
         }
     }
